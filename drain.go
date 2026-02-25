@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	payloadMagic   = "drn3"
-	payloadVersion = byte(1)
+	payloadMagic                = "drn3"
+	payloadVersion              = byte(1)
+	adaptiveIDPathMinCandidates = 16
 )
 
 // Template is a trained log template.
@@ -127,6 +128,25 @@ func (m *Matcher) Match(line string) (templateID int, args []string, ok bool) {
 	return cluster.id, extractArgsByID(cluster.tokenIDs, tokens, m.paramID, cluster.paramCount), true
 }
 
+// MatchID returns template id and whether a match was found.
+func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
+	if m == nil {
+		return 0, false
+	}
+	var tokens []string
+	if len(m.cfg.ExtraDelimiters) == 0 {
+		var tokenBuf [32]string
+		tokens = tokenizeWhitespaceInto(line, tokenBuf[:0])
+	} else {
+		tokens = tokenize(line, m.cfg.ExtraDelimiters)
+	}
+	cluster := m.treeSearchDrainMatch(tokens, m.cfg.MatchThreshold)
+	if cluster == nil {
+		return 0, false
+	}
+	return cluster.id, true
+}
+
 func (m *Matcher) treeSearchDrainMatch(tokens []string, simTh float64) *drainCluster {
 	tokenCount := len(tokens)
 	curNode := m.root[tokenCount]
@@ -163,7 +183,7 @@ func (m *Matcher) treeSearchDrainMatch(tokens []string, simTh float64) *drainClu
 		curDepth++
 	}
 
-	return m.fastMatchDrainTokens(curNode.clusterIDs, tokens, simTh)
+	return m.fastMatchDrainAdaptive(curNode.clusterIDs, tokens, simTh)
 }
 
 // MarshalBinary serializes matcher as version + config + templates.
@@ -841,6 +861,35 @@ func (m *Matcher) fastMatchDrainTokens(clusterIDs []int, tokens []string, simTh 
 		return maxCluster
 	}
 	return nil
+}
+
+func (m *Matcher) fastMatchDrainAdaptive(clusterIDs []int, tokens []string, simTh float64) *drainCluster {
+	if len(clusterIDs) >= adaptiveIDPathMinCandidates {
+		var tokenIDBuf [32]uint64
+		if tokenIDs, ok := m.lookupKnownTokenIDs(tokens, tokenIDBuf[:0]); ok {
+			return m.fastMatchDrain(clusterIDs, tokenIDs, simTh, true)
+		}
+	}
+	return m.fastMatchDrainTokens(clusterIDs, tokens, simTh)
+}
+
+func (m *Matcher) lookupKnownTokenIDs(tokens []string, dst []uint64) ([]uint64, bool) {
+	if len(tokens) == 0 {
+		return nil, true
+	}
+	if cap(dst) < len(tokens) {
+		dst = make([]uint64, len(tokens))
+	} else {
+		dst = dst[:len(tokens)]
+	}
+	for i := range len(tokens) {
+		tokenID, ok := m.dict.lookup(tokens[i])
+		if !ok {
+			return nil, false
+		}
+		dst[i] = tokenID
+	}
+	return dst, true
 }
 
 func (m *Matcher) seqScoreDrain(seq1 []uint64, paramCount int, seq2 []uint64, includeParams bool) (int, int) {

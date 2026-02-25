@@ -189,6 +189,31 @@ func TestTrainWithConfigImmediateMatch(t *testing.T) {
 	}
 }
 
+func TestMatchIDParity(t *testing.T) {
+	samples := []string{
+		"service 1 level INFO user 10 action 5",
+		"service 2 level INFO user 20 action 5",
+		"service 9 level WARN user 30 action 8",
+	}
+	m, err := Train(samples)
+	if err != nil {
+		t.Fatalf("train failed: %v", err)
+	}
+
+	cases := []string{
+		"service 77 level INFO user 999 action 5",
+		"service 9 level WARN user 33 action 8",
+		"service 1 level ERROR user 10 action 5",
+	}
+	for _, line := range cases {
+		idWithArgs, _, okWithArgs := m.Match(line)
+		idOnly, okOnly := m.MatchID(line)
+		if idOnly != idWithArgs || okOnly != okWithArgs {
+			t.Fatalf("mismatch for %q: Match=(id=%d ok=%v) MatchID=(id=%d ok=%v)", line, idWithArgs, okWithArgs, idOnly, okOnly)
+		}
+	}
+}
+
 func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
 	const (
 		path       = "data.json"
@@ -232,7 +257,7 @@ func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
 		for b.Loop() {
 			var matchedRows int
 			err := forEachJSONLine(path, func(line string) error {
-				_, _, ok := m.Match(line)
+				_, ok := m.MatchID(line)
 				if ok {
 					matchedRows++
 				}
