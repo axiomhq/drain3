@@ -8,8 +8,6 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 )
 
 const (
@@ -111,6 +109,11 @@ func (m *Matcher) Templates() []Template {
 
 // Match returns template id, extracted args, and whether a match was found.
 func (m *Matcher) Match(line string) (templateID int, args []string, ok bool) {
+	return m.MatchInto(line, nil)
+}
+
+// MatchInto returns template id, extracted args into dst, and whether a match was found.
+func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []string, ok bool) {
 	if m == nil {
 		return 0, nil, false
 	}
@@ -125,7 +128,7 @@ func (m *Matcher) Match(line string) (templateID int, args []string, ok bool) {
 	if cluster == nil {
 		return 0, nil, false
 	}
-	return cluster.id, extractArgsByID(cluster.tokenIDs, tokens, m.paramID, cluster.paramCount), true
+	return cluster.id, extractArgsByIDInto(cluster.tokenIDs, tokens, m.paramID, cluster.paramCount, dst), true
 }
 
 // MatchID returns template id and whether a match was found.
@@ -436,62 +439,28 @@ func tokenize(content string, extraDelimiters []string) []string {
 }
 
 func tokenizeWhitespaceInto(content string, dst []string) []string {
-	dst = dst[:0]
 	if content == "" {
-		return dst
+		return nil
 	}
-
-	n := len(content)
-	i := 0
-	for i < n {
-		for i < n {
-			b := content[i]
-			if b < utf8.RuneSelf {
-				if !isWhitespaceASCII(b) {
-					break
-				}
-				i++
-				continue
-			}
-			r, sz := utf8.DecodeRuneInString(content[i:])
-			if !unicode.IsSpace(r) {
-				break
-			}
-			i += sz
-		}
-		start := i
-		for i < n {
-			b := content[i]
-			if b < utf8.RuneSelf {
-				if isWhitespaceASCII(b) {
-					break
-				}
-				i++
-				continue
-			}
-			r, sz := utf8.DecodeRuneInString(content[i:])
-			if unicode.IsSpace(r) {
-				break
-			}
-			i += sz
-		}
-		if start < i {
+	if dst != nil {
+		dst = dst[:0]
+	}
+	start := 0
+	for i := 0; i < len(content); i++ {
+		if content[i] == ' ' {
 			dst = append(dst, content[start:i])
+			start = i + 1
 		}
 	}
+	dst = append(dst, content[start:])
 	return dst
 }
 
-func isWhitespaceASCII(c byte) bool {
-	switch c {
-	case ' ', '\t', '\n', '\r', '\f', '\v':
-		return true
-	default:
-		return false
-	}
+func extractArgsByID(templateTokenIDs []uint64, lineTokens []string, paramID uint64, paramCount int) []string {
+	return extractArgsByIDInto(templateTokenIDs, lineTokens, paramID, paramCount, nil)
 }
 
-func extractArgsByID(templateTokenIDs []uint64, lineTokens []string, paramID uint64, paramCount int) []string {
+func extractArgsByIDInto(templateTokenIDs []uint64, lineTokens []string, paramID uint64, paramCount int, dst []string) []string {
 	if len(templateTokenIDs) == 0 || len(lineTokens) == 0 || paramCount == 0 {
 		return nil
 	}
@@ -502,7 +471,10 @@ func extractArgsByID(templateTokenIDs []uint64, lineTokens []string, paramID uin
 	if paramCount > limit {
 		paramCount = limit
 	}
-	args := make([]string, 0, paramCount)
+	args := dst[:0]
+	if cap(args) < paramCount {
+		args = make([]string, 0, paramCount)
+	}
 	for i := 0; i < limit; i++ {
 		if templateTokenIDs[i] == paramID {
 			args = append(args, lineTokens[i])

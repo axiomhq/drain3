@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -212,6 +213,295 @@ func TestMatchIDParity(t *testing.T) {
 			t.Fatalf("mismatch for %q: Match=(id=%d ok=%v) MatchID=(id=%d ok=%v)", line, idWithArgs, okWithArgs, idOnly, okOnly)
 		}
 	}
+}
+
+func TestMatchIntoParityAndReuse(t *testing.T) {
+	samples := []string{
+		"service 1 level INFO user 10 action 5",
+		"service 2 level INFO user 20 action 5",
+		"service 3 level INFO user 30 action 5",
+	}
+	m, err := Train(samples)
+	if err != nil {
+		t.Fatalf("train failed: %v", err)
+	}
+
+	line := "service 99 level INFO user 777 action 5"
+	idA, argsA, okA := m.Match(line)
+
+	scratch := make([]string, 1, 8)
+	idB, argsB, okB := m.MatchInto(line, scratch[:0])
+	if idA != idB || okA != okB || !reflect.DeepEqual(argsA, argsB) {
+		t.Fatalf("MatchInto mismatch: Match=(%d,%v,%v) MatchInto=(%d,%v,%v)", idA, argsA, okA, idB, argsB, okB)
+	}
+	if len(argsB) == 0 {
+		t.Fatalf("expected extracted params")
+	}
+	if &argsB[0] != &scratch[0] {
+		t.Fatalf("expected MatchInto to reuse destination buffer")
+	}
+
+	_, argsNoMatch, okNoMatch := m.MatchInto("short unmatched", scratch[:0])
+	if okNoMatch {
+		t.Fatalf("expected no match")
+	}
+	if len(argsNoMatch) != 0 {
+		t.Fatalf("expected empty args on miss, got %v", argsNoMatch)
+	}
+}
+
+func TestTokenizeWhitespaceIntoPreservesSpaceBoundaries(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    []string
+		wantNil bool
+	}{
+		{name: "single space", in: "a b", want: []string{"a", "b"}},
+		{name: "double spaces", in: "a  b", want: []string{"a", "", "b"}},
+		{name: "triple spaces", in: "a   b", want: []string{"a", "", "", "b"}},
+		{name: "leading space", in: " a", want: []string{"", "a"}},
+		{name: "trailing space", in: "a ", want: []string{"a", ""}},
+		{name: "only spaces", in: "  ", want: []string{"", "", ""}},
+		{name: "unicode tokens", in: "α  β γ", want: []string{"α", "", "β", "γ"}},
+		{name: "empty string", in: "", wantNil: true},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := tokenizeWhitespaceInto(tc.in, nil)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil, got %v", got)
+				}
+				return
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("tokenizeWhitespaceInto(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+
+			scratch := make([]string, 0, 8)
+			gotReuse := tokenizeWhitespaceInto(tc.in, scratch[:0])
+			if !reflect.DeepEqual(gotReuse, tc.want) {
+				t.Fatalf("tokenizeWhitespaceInto with scratch (%q) = %v, want %v", tc.in, gotReuse, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchIsSensitiveToRepeatedSpaces(t *testing.T) {
+	m, err := Train([]string{"a  b"})
+	if err != nil {
+		t.Fatalf("train failed: %v", err)
+	}
+
+	if _, _, ok := m.Match("a  b"); !ok {
+		t.Fatalf("expected double-space query to match double-space template")
+	}
+	if _, _, ok := m.Match("a b"); ok {
+		t.Fatalf("expected single-space query not to match double-space template")
+	}
+}
+
+func TestColumnStyleClusterRemapFlow(t *testing.T) {
+	const invalidTemplateID = ^uint32(0)
+
+	trainingLines := []string{
+		"svc auth user 100 status ok",
+		"svc auth user 200 status ok",
+		"svc billing user 12 status fail",
+		"literal no params line",
+	}
+	m, err := Train(trainingLines)
+	if err != nil {
+		t.Fatalf("train failed: %v", err)
+	}
+
+	clusters := m.Templates()
+	if len(clusters) == 0 {
+		t.Fatalf("expected templates")
+	}
+
+	maxClusterID := 0
+	for _, cluster := range clusters {
+		if cluster.ID <= 0 {
+			t.Fatalf("expected positive cluster ID, got %d", cluster.ID)
+		}
+		if cluster.ID > maxClusterID {
+			maxClusterID = cluster.ID
+		}
+	}
+
+	clusterTemplateIDs := make([]uint32, maxClusterID+1)
+	for i := range clusterTemplateIDs {
+		clusterTemplateIDs[i] = invalidTemplateID
+	}
+
+	paramString := DefaultConfig().ParamString
+	templateParamCounts := make([]int, 0, len(clusters))
+	for _, cluster := range clusters {
+		templateID := uint32(len(templateParamCounts))
+		clusterTemplateIDs[cluster.ID] = templateID
+		templateParamCounts = append(templateParamCounts, countParamTokens(cluster.Tokens, paramString))
+	}
+
+	scratch := make([]string, 0, 64)
+	lines := []string{
+		"svc auth user 999 status ok",
+		"svc billing user 33 status fail",
+		"literal no params line",
+	}
+
+	for _, line := range lines {
+		clusterID, params, matched := m.MatchInto(line, scratch[:0])
+		if !matched {
+			t.Fatalf("expected match for %q", line)
+		}
+		if clusterID <= 0 || clusterID >= len(clusterTemplateIDs) {
+			t.Fatalf("cluster ID out of range: %d", clusterID)
+		}
+
+		templateID := clusterTemplateIDs[clusterID]
+		if templateID == invalidTemplateID {
+			t.Fatalf("no mapped template ID for cluster ID %d", clusterID)
+		}
+
+		expectedParamCount := templateParamCounts[int(templateID)]
+		if len(params) != expectedParamCount {
+			t.Fatalf("param count mismatch for line %q: got %d want %d", line, len(params), expectedParamCount)
+		}
+	}
+
+	_, _, matched := m.MatchInto("no_match", scratch[:0])
+	if matched {
+		t.Fatalf("expected no match for unmatched line")
+	}
+}
+
+func TestLosslessRoundTripWithRawFallback(t *testing.T) {
+	const invalidTemplateID = -1
+
+	trainingLines := []string{
+		"svc auth user 100 status ok",
+		"svc auth user 200 status ok",
+		"alpha  beta",
+		"alpha  gamma",
+		"literal no params line",
+	}
+	m, err := Train(trainingLines)
+	if err != nil {
+		t.Fatalf("train failed: %v", err)
+	}
+
+	templates := m.Templates()
+	if len(templates) == 0 {
+		t.Fatalf("expected templates")
+	}
+
+	maxClusterID := 0
+	for _, template := range templates {
+		if template.ID > maxClusterID {
+			maxClusterID = template.ID
+		}
+	}
+	clusterToTemplate := make([]int, maxClusterID+1)
+	for i := range clusterToTemplate {
+		clusterToTemplate[i] = invalidTemplateID
+	}
+
+	paramString := m.Config().ParamString
+	templateParamCounts := make([]int, len(templates))
+	for templateID, template := range templates {
+		clusterToTemplate[template.ID] = templateID
+		templateParamCounts[templateID] = countParamTokens(template.Tokens, paramString)
+	}
+
+	lines := []string{
+		"svc auth user 300 status ok",   // matched template + params
+		"svc auth user 300 status fail", // unmatched -> raw fallback
+		"alpha  delta",                  // matched template + spaces preserved
+		"alpha delta",                   // unmatched -> raw fallback
+		"literal no params line",        // matched exact template
+	}
+
+	out := make([]string, len(lines))
+	scratch := make([]string, 0, 16)
+	matchedCount := 0
+	rawFallbackCount := 0
+	for i, line := range lines {
+		clusterID, params, matched := m.MatchInto(line, scratch[:0])
+		if !matched {
+			out[i] = line
+			rawFallbackCount++
+			continue
+		}
+
+		if clusterID <= 0 || clusterID >= len(clusterToTemplate) {
+			t.Fatalf("cluster ID out of range: %d", clusterID)
+		}
+		templateID := clusterToTemplate[clusterID]
+		if templateID == invalidTemplateID {
+			t.Fatalf("no template mapping for cluster ID %d", clusterID)
+		}
+
+		expectedParams := templateParamCounts[templateID]
+		if len(params) != expectedParams {
+			out[i] = line
+			rawFallbackCount++
+			continue
+		}
+
+		rendered, ok := renderTemplateWithParams(templates[templateID].Tokens, params, paramString)
+		if !ok {
+			out[i] = line
+			rawFallbackCount++
+			continue
+		}
+
+		out[i] = rendered
+		matchedCount++
+	}
+
+	if matchedCount == 0 {
+		t.Fatalf("expected at least one matched row")
+	}
+	if rawFallbackCount == 0 {
+		t.Fatalf("expected at least one raw fallback row")
+	}
+	if !reflect.DeepEqual(out, lines) {
+		t.Fatalf("lossless round-trip mismatch\nin:  %q\nout: %q", lines, out)
+	}
+}
+
+func renderTemplateWithParams(templateTokens []string, params []string, paramString string) (string, bool) {
+	rendered := make([]string, len(templateTokens))
+	paramIdx := 0
+	for i, token := range templateTokens {
+		if token != paramString {
+			rendered[i] = token
+			continue
+		}
+		if paramIdx >= len(params) {
+			return "", false
+		}
+		rendered[i] = params[paramIdx]
+		paramIdx++
+	}
+	if paramIdx != len(params) {
+		return "", false
+	}
+	return strings.Join(rendered, " "), true
+}
+
+func countParamTokens(tokens []string, paramString string) int {
+	count := 0
+	for _, token := range tokens {
+		if token == paramString {
+			count++
+		}
+	}
+	return count
 }
 
 func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
