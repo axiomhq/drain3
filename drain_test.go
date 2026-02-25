@@ -6,8 +6,10 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTrainMatchBasic(t *testing.T) {
@@ -543,9 +545,15 @@ func countParamTokens(tokens []string, paramString string) int {
 	return count
 }
 
-func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
+// matchEntry holds the compressed representation of a matched line.
+type matchEntry struct {
+	templateID uint32
+	args       []string
+}
+
+func BenchmarkCompression(b *testing.B) {
 	const (
-		path       = "data.json"
+		path       = "strs.json"
 		sampleRate = 0.10
 		seed       = 42
 	)
@@ -554,7 +562,6 @@ func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
 		b.Skipf("benchmark corpus not found at %q: %v", path, err)
 	}
 
-	// Pre-load all lines into memory to measure pure matching performance.
 	var allLines []string
 	err := forEachJSONLine(path, func(line string) error {
 		allLines = append(allLines, line)
@@ -568,52 +575,671 @@ func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
 		b.Fatalf("empty corpus in %q", path)
 	}
 
-	// Sample training rows.
+	// Sample 1% for training.
 	rng := rand.New(rand.NewSource(seed))
 	var trainRows []string
-	var firstLine string
 	for _, line := range allLines {
-		if firstLine == "" {
-			firstLine = line
-		}
 		if rng.Float64() < sampleRate {
 			trainRows = append(trainRows, line)
 		}
 	}
 	if len(trainRows) == 0 {
-		trainRows = append(trainRows, firstLine)
+		trainRows = append(trainRows, allLines[0])
 	}
 
-	b.Run("train_10pct", func(b *testing.B) {
+	// Total raw bytes for compression ratio.
+	var rawBytes int
+	for _, line := range allLines {
+		rawBytes += len(line)
+	}
+
+	b.Logf("corpus: %d lines, %d train samples (%.1f%%), %.1f MB raw",
+		totalRows, len(trainRows), 100*float64(len(trainRows))/float64(totalRows),
+		float64(rawBytes)/(1<<20))
+
+	// --- Sub-benchmark: training only ---
+	b.Run("train", func(b *testing.B) {
 		b.ReportAllocs()
-		b.ReportMetric(float64(totalRows), "rows/op")
-		b.ReportMetric(float64(len(trainRows)), "train_rows/op")
 		for b.Loop() {
 			if _, err := Train(trainRows); err != nil {
-				b.Fatalf("train matcher: %v", err)
+				b.Fatalf("train: %v", err)
 			}
 		}
+		b.ReportMetric(float64(len(trainRows)), "train_rows/op")
 	})
 
-	m, err2 := Train(trainRows)
-	if err2 != nil {
-		b.Fatalf("train matcher: %v", err2)
+	// Train once for the matching benchmarks.
+	matcher, err := Train(trainRows)
+	if err != nil {
+		b.Fatalf("train: %v", err)
+	}
+	templates := matcher.Templates()
+
+	// Build cluster ID → dense template ID remap.
+	maxClusterID := 0
+	for _, t := range templates {
+		if t.ID > maxClusterID {
+			maxClusterID = t.ID
+		}
+	}
+	clusterToTemplate := make([]uint32, maxClusterID+1)
+	for i := range clusterToTemplate {
+		clusterToTemplate[i] = ^uint32(0)
+	}
+	paramString := matcher.Config().ParamString
+	templateParamCounts := make([]int, len(templates))
+	for denseID, t := range templates {
+		clusterToTemplate[t.ID] = uint32(denseID)
+		templateParamCounts[denseID] = countParamTokens(t.Tokens, paramString)
 	}
 
-	b.Run("match_all_with_pretrained_matcher", func(b *testing.B) {
+	b.Logf("templates: %d", len(templates))
+
+	// --- Sub-benchmark: match + build compressed output ---
+	b.Run("match_and_compress", func(b *testing.B) {
 		b.ReportAllocs()
-		b.ReportMetric(float64(totalRows), "rows/op")
-		b.ReportMetric(float64(len(trainRows)), "train_rows/op")
 		for b.Loop() {
-			var matchedRows int
-			for _, line := range allLines {
-				_, ok := m.MatchID(line)
-				if ok {
-					matchedRows++
+			// Bitmap: bit set = matched, bit clear = unmatched.
+			bitmap := make([]uint64, (totalRows+63)/64)
+			matches := make([]matchEntry, 0, totalRows)
+			unmatched := make([]string, 0, totalRows/10)
+			scratch := make([]string, 0, 64)
+
+			for i, line := range allLines {
+				clusterID, args, ok := matcher.MatchInto(line, scratch[:0])
+				if !ok || clusterID <= 0 || clusterID >= len(clusterToTemplate) || clusterToTemplate[clusterID] == ^uint32(0) {
+					unmatched = append(unmatched, line)
+					matches = append(matches, matchEntry{}) // placeholder to keep index alignment
+					continue
+				}
+				bitmap[i/64] |= 1 << (uint(i) % 64)
+				argsCopy := make([]string, len(args))
+				copy(argsCopy, args)
+				matches = append(matches, matchEntry{
+					templateID: clusterToTemplate[clusterID],
+					args:       argsCopy,
+				})
+			}
+
+			matchedCount := 0
+			for _, word := range bitmap {
+				matchedCount += popcount(word)
+			}
+
+			b.ReportMetric(float64(matchedCount), "matched/op")
+			b.ReportMetric(float64(totalRows-matchedCount), "unmatched/op")
+			b.ReportMetric(100*float64(matchedCount)/float64(totalRows), "hit_pct/op")
+
+			// Compressed size estimate: bitmap + matched entries + unmatched raw strings.
+			compressedBytes := len(bitmap)*8 + // bitmap
+				matchedCount*4 // template IDs (uint32)
+			for _, m := range matches {
+				for _, a := range m.args {
+					compressedBytes += len(a)
 				}
 			}
-			b.ReportMetric(float64(matchedRows), "matched_rows/op")
+			for _, s := range unmatched {
+				compressedBytes += len(s)
+			}
+			// Add serialized matcher size.
+			payload, _ := matcher.MarshalBinary()
+			compressedBytes += len(payload)
+
+			b.ReportMetric(float64(rawBytes)/(1<<20), "raw_MB/op")
+			b.ReportMetric(float64(compressedBytes)/(1<<20), "compressed_MB/op")
+			if compressedBytes > 0 {
+				b.ReportMetric(float64(rawBytes)/float64(compressedBytes), "ratio/op")
+			}
+			b.ReportMetric(float64(len(payload)), "matcher_bytes/op")
 		}
+		b.ReportMetric(float64(totalRows), "rows/op")
+	})
+
+	// --- Sub-benchmark: match-only (no output allocation) ---
+	b.Run("match_only", func(b *testing.B) {
+		b.ReportAllocs()
+		var matched int
+		for b.Loop() {
+			matched = 0
+			for _, line := range allLines {
+				if _, ok := matcher.MatchID(line); ok {
+					matched++
+				}
+			}
+		}
+		b.ReportMetric(float64(totalRows), "rows/op")
+		b.ReportMetric(float64(matched), "matched/op")
+	})
+}
+
+func popcount(x uint64) int {
+	// Kernighan's bit counting.
+	n := 0
+	for x != 0 {
+		x &= x - 1
+		n++
+	}
+	return n
+}
+
+func TestTopKCompression(t *testing.T) {
+	const (
+		path       = "strs.json"
+		sampleRate = 0.10
+		seed       = 42
+	)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("corpus not found at %q: %v", path, err)
+	}
+
+	var allLines []string
+	if err := forEachJSONLine(path, func(line string) error {
+		allLines = append(allLines, line)
+		return nil
+	}); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	totalRows := len(allLines)
+
+	var rawBytes int
+	for _, l := range allLines {
+		rawBytes += len(l)
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	var sample []string
+	for _, l := range allLines {
+		if rng.Float64() < sampleRate {
+			sample = append(sample, l)
+		}
+	}
+
+	full, err := Train(sample)
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+
+	// Sort templates by count descending.
+	templates := full.Templates()
+	sort.Slice(templates, func(i, j int) bool { return templates[i].Count > templates[j].Count })
+
+	for _, topK := range []int{250} {
+		topK := topK
+		t.Run(fmt.Sprintf("top%d", topK), func(t *testing.T) {
+			keep := templates
+			if topK < len(keep) {
+				keep = keep[:topK]
+			}
+
+			// Rebuild matcher from pruned templates.
+			m, err := rebuildMatcherFromTemplates(full.Config(), keep)
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+
+			// Build remap table.
+			maxCID := 0
+			for _, tmpl := range keep {
+				if tmpl.ID > maxCID {
+					maxCID = tmpl.ID
+				}
+			}
+			clusterToTemplate := make([]uint32, maxCID+1)
+			for i := range clusterToTemplate {
+				clusterToTemplate[i] = ^uint32(0)
+			}
+			paramString := m.Config().ParamString
+			for denseID, tmpl := range keep {
+				clusterToTemplate[tmpl.ID] = uint32(denseID)
+			}
+
+			// Match full corpus.
+			scratch := make([]string, 0, 64)
+			var matchedCount, unmatchedCount int
+			compressedBytes := 0
+			for _, line := range allLines {
+				cid, args, ok := m.MatchInto(line, scratch[:0])
+				if !ok || cid <= 0 || cid >= len(clusterToTemplate) || clusterToTemplate[cid] == ^uint32(0) {
+					unmatchedCount++
+					compressedBytes += len(line) // raw fallback
+					continue
+				}
+				matchedCount++
+				compressedBytes += 4 // template ID
+				for _, a := range args {
+					compressedBytes += len(a)
+				}
+			}
+
+			// Bitmap.
+			compressedBytes += (totalRows + 63) / 64 * 8
+
+			// Matcher payload.
+			payload, _ := m.MarshalBinary()
+			compressedBytes += len(payload)
+
+			_ = paramString
+			ratio := float64(rawBytes) / float64(compressedBytes)
+
+			t.Logf("templates: %d | matched: %d (%.1f%%) | unmatched: %d | compressed: %.1f MB | ratio: %.2fx | matcher: %d bytes",
+				len(keep), matchedCount, 100*float64(matchedCount)/float64(totalRows),
+				unmatchedCount,
+				float64(compressedBytes)/(1<<20), ratio,
+				len(payload))
+		})
+	}
+}
+
+func TestFullSweep(t *testing.T) {
+	const (
+		path       = "strs.json"
+		sampleRate = 0.10
+		seed       = 42
+	)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("corpus not found at %q: %v", path, err)
+	}
+
+	var allLines []string
+	if err := forEachJSONLine(path, func(line string) error {
+		allLines = append(allLines, line)
+		return nil
+	}); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	totalRows := len(allLines)
+
+	var rawBytes int
+	for _, l := range allLines {
+		rawBytes += len(l)
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	var sample []string
+	for _, l := range allLines {
+		if rng.Float64() < sampleRate {
+			sample = append(sample, l)
+		}
+	}
+
+	simThs := []float64{0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
+	topKs := []int{10, 25, 50, 100, 250, 500, 1000}
+	maxTokensVals := []int{32, 64, 128, 256}
+	maxBytesVals := []int{512, 1024, 2048}
+
+	type result struct {
+		simTh    float64
+		topK     int
+		maxTok   int
+		maxBytes int
+		hitPct   float64
+		savedMB  float64
+		savedPct float64
+		ratio    float64
+		matchMs  float64
+		trainMs  float64
+	}
+	var results []result
+
+	for _, simTh := range simThs {
+		for _, maxTok := range maxTokensVals {
+			for _, maxB := range maxBytesVals {
+				cfg := DefaultConfig()
+				cfg.SimilarityThreshold = simTh
+				cfg.MaxTokens = maxTok
+				cfg.MaxBytes = maxB
+
+				trainStart := time.Now()
+				full, err := TrainWithConfig(sample, cfg)
+				trainElapsed := time.Since(trainStart)
+				if err != nil {
+					t.Fatalf("train: %v", err)
+				}
+
+				templates := full.Templates()
+				sort.Slice(templates, func(i, j int) bool { return templates[i].Count > templates[j].Count })
+
+				for _, topK := range topKs {
+					keep := templates
+					if topK < len(keep) {
+						keep = keep[:topK]
+					}
+
+					m, err := rebuildMatcherFromTemplates(full.Config(), keep)
+					if err != nil {
+						t.Fatalf("rebuild: %v", err)
+					}
+
+					maxCID := 0
+					for _, tmpl := range keep {
+						if tmpl.ID > maxCID {
+							maxCID = tmpl.ID
+						}
+					}
+					remap := make([]uint32, maxCID+1)
+					for i := range remap {
+						remap[i] = ^uint32(0)
+					}
+					for denseID, tmpl := range keep {
+						remap[tmpl.ID] = uint32(denseID)
+					}
+
+					// Measure match speed (MatchID only, no alloc noise).
+					matchStart := time.Now()
+					var matchedCount int
+					for _, line := range allLines {
+						if _, ok := m.MatchID(line); ok {
+							matchedCount++
+						}
+					}
+					matchElapsed := time.Since(matchStart)
+
+					// Measure compressed size with full MatchInto.
+					scratch := make([]string, 0, 64)
+					compressedBytes := 0
+					for _, line := range allLines {
+						cid, args, ok := m.MatchInto(line, scratch[:0])
+						if !ok || cid <= 0 || cid >= len(remap) || remap[cid] == ^uint32(0) {
+							compressedBytes += len(line)
+							continue
+						}
+						compressedBytes += 4
+						for _, a := range args {
+							compressedBytes += len(a)
+						}
+					}
+					compressedBytes += (totalRows + 63) / 64 * 8
+					payload, _ := m.MarshalBinary()
+					compressedBytes += len(payload)
+
+					saved := rawBytes - compressedBytes
+					results = append(results, result{
+						simTh:    simTh,
+						topK:     topK,
+						maxTok:   maxTok,
+						maxBytes: maxB,
+						hitPct:   100 * float64(matchedCount) / float64(totalRows),
+						savedMB:  float64(saved) / (1 << 20),
+						savedPct: 100 * float64(saved) / float64(rawBytes),
+						ratio:    float64(rawBytes) / float64(compressedBytes),
+						matchMs:  float64(matchElapsed.Milliseconds()),
+						trainMs:  float64(trainElapsed.Milliseconds()),
+					})
+				}
+			}
+		}
+	}
+
+	// Sort by saved descending.
+	sort.Slice(results, func(i, j int) bool { return results[i].savedMB > results[j].savedMB })
+
+	t.Logf("\n%-5s %-5s %-6s %-6s | %6s %8s %6s %5s %8s %8s",
+		"sim", "topK", "maxTok", "maxB", "hit%", "saved MB", "saved%", "ratio", "match ms", "train ms")
+	t.Logf("%s", strings.Repeat("-", 85))
+	for _, r := range results {
+		t.Logf("%-5.1f %-5d %-6d %-6d | %5.1f%% %7.1f MB %5.1f%% %5.2fx %7.0f ms %7.0f ms",
+			r.simTh, r.topK, r.maxTok, r.maxBytes,
+			r.hitPct, r.savedMB, r.savedPct, r.ratio, r.matchMs, r.trainMs)
+	}
+}
+
+func TestSimilarityTopKMatrix(t *testing.T) {
+	const (
+		path       = "strs.json"
+		sampleRate = 0.10
+		seed       = 42
+	)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("corpus not found at %q: %v", path, err)
+	}
+
+	var allLines []string
+	if err := forEachJSONLine(path, func(line string) error {
+		allLines = append(allLines, line)
+		return nil
+	}); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	totalRows := len(allLines)
+
+	var rawBytes int
+	for _, l := range allLines {
+		rawBytes += len(l)
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	var sample []string
+	for _, l := range allLines {
+		if rng.Float64() < sampleRate {
+			sample = append(sample, l)
+		}
+	}
+
+	topKs := []int{10, 25, 50, 100, 250, 500, 1000}
+	simThs := []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
+
+	for _, simTh := range simThs {
+		cfg := DefaultConfig()
+		cfg.SimilarityThreshold = simTh
+
+		full, err := TrainWithConfig(sample, cfg)
+		if err != nil {
+			t.Fatalf("train sim=%.1f: %v", simTh, err)
+		}
+
+		templates := full.Templates()
+		sort.Slice(templates, func(i, j int) bool { return templates[i].Count > templates[j].Count })
+
+		for _, topK := range topKs {
+			keep := templates
+			if topK < len(keep) {
+				keep = keep[:topK]
+			}
+
+			m, err := rebuildMatcherFromTemplates(full.Config(), keep)
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+
+			maxCID := 0
+			for _, tmpl := range keep {
+				if tmpl.ID > maxCID {
+					maxCID = tmpl.ID
+				}
+			}
+			clusterToTemplate := make([]uint32, maxCID+1)
+			for i := range clusterToTemplate {
+				clusterToTemplate[i] = ^uint32(0)
+			}
+			for denseID, tmpl := range keep {
+				clusterToTemplate[tmpl.ID] = uint32(denseID)
+			}
+
+			scratch := make([]string, 0, 64)
+			var matchedCount int
+			compressedBytes := 0
+			for _, line := range allLines {
+				cid, args, ok := m.MatchInto(line, scratch[:0])
+				if !ok || cid <= 0 || cid >= len(clusterToTemplate) || clusterToTemplate[cid] == ^uint32(0) {
+					compressedBytes += len(line)
+					continue
+				}
+				matchedCount++
+				compressedBytes += 4
+				for _, a := range args {
+					compressedBytes += len(a)
+				}
+			}
+			compressedBytes += (totalRows + 63) / 64 * 8
+			payload, _ := m.MarshalBinary()
+			compressedBytes += len(payload)
+
+			saved := rawBytes - compressedBytes
+			reduction := 100 * float64(saved) / float64(rawBytes)
+
+			t.Logf("sim=%.1f top=%4d | hit=%.1f%% | %.1f MB saved (%.1f%%) | ratio=%.2fx",
+				simTh, topK,
+				100*float64(matchedCount)/float64(totalRows),
+				float64(saved)/(1<<20), reduction,
+				float64(rawBytes)/float64(compressedBytes))
+		}
+	}
+}
+
+
+func TestTemplateHitDistribution(t *testing.T) {
+	const (
+		path       = "strs.json"
+		sampleRate = 0.10
+		seed       = 42
+	)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("corpus not found at %q: %v", path, err)
+	}
+
+	var allLines []string
+	if err := forEachJSONLine(path, func(line string) error {
+		allLines = append(allLines, line)
+		return nil
+	}); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	var sample []string
+	for _, l := range allLines {
+		if rng.Float64() < sampleRate {
+			sample = append(sample, l)
+		}
+	}
+
+	m, err := Train(sample)
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+
+	// Count hits per template across the full corpus.
+	hits := make(map[int]int)
+	var missed int
+	for _, line := range allLines {
+		id, ok := m.MatchID(line)
+		if ok {
+			hits[id]++
+		} else {
+			missed++
+		}
+	}
+
+	type entry struct {
+		id    int
+		count int
+	}
+	sorted := make([]entry, 0, len(hits))
+	for id, count := range hits {
+		sorted = append(sorted, entry{id, count})
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].count > sorted[j].count })
+
+	total := len(allLines)
+	cumulative := 0
+	for i, topK := range []int{10, 25, 50, 100, 250, 500, 1000, len(sorted)} {
+		if topK > len(sorted) {
+			topK = len(sorted)
+		}
+		for cumulative == 0 || i > 0 {
+			// only recalculate when topK changes
+			cumulative = 0
+			for j := 0; j < topK; j++ {
+				cumulative += sorted[j].count
+			}
+			break
+		}
+		// recalculate properly
+		cum := 0
+		for j := 0; j < topK; j++ {
+			cum += sorted[j].count
+		}
+		t.Logf("top %5d templates: %7d/%d matched (%.1f%% of corpus, %.1f%% of all matches)",
+			topK, cum, total,
+			100*float64(cum)/float64(total),
+			100*float64(cum)/float64(total-missed))
+	}
+	t.Logf("total templates: %d, missed: %d (%.1f%%)", len(sorted), missed, 100*float64(missed)/float64(total))
+}
+
+func BenchmarkTrainMatch(b *testing.B) {
+	// Synthetic corpus that exercises tokenizeWhitespaceInto (via Train and Match)
+	// and strings.Count (via MatchID/MatchInto fast-reject).
+	// Each line has ~10 tokens with a mix of fixed and variable parts.
+	const nLines = 5000
+	rng := rand.New(rand.NewSource(99))
+	prefixes := []string{
+		"svc auth user %d status ok latency %d region us-east-1 method GET",
+		"svc billing user %d amount %d currency USD region eu-west-1 method POST",
+		"svc gateway request %d upstream %d duration 42 region ap-south-1 method PUT",
+		"svc storage bucket %d object %d size 1024 region us-west-2 method DELETE",
+		"svc scheduler job %d worker %d priority high region us-central-1 method PATCH",
+	}
+
+	lines := make([]string, nLines)
+	for i := range lines {
+		tmpl := prefixes[i%len(prefixes)]
+		lines[i] = fmt.Sprintf(tmpl, rng.Intn(10000), rng.Intn(10000))
+	}
+
+	// Split: 10% train, rest for matching.
+	trainLines := lines[:nLines/10]
+	matchLines := lines
+
+	b.Run("train", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := Train(trainLines); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.ReportMetric(float64(len(trainLines)), "lines/op")
+	})
+
+	matcher, err := Train(trainLines)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Logf("templates: %d", len(matcher.Templates()))
+
+	b.Run("match_id", func(b *testing.B) {
+		b.ReportAllocs()
+		var matched int
+		for b.Loop() {
+			matched = 0
+			for _, line := range matchLines {
+				if _, ok := matcher.MatchID(line); ok {
+					matched++
+				}
+			}
+		}
+		b.ReportMetric(float64(len(matchLines)), "lines/op")
+		b.ReportMetric(float64(matched), "matched/op")
+	})
+
+	b.Run("match_into", func(b *testing.B) {
+		b.ReportAllocs()
+		scratch := make([]string, 0, 16)
+		var matched int
+		for b.Loop() {
+			matched = 0
+			for _, line := range matchLines {
+				if _, _, ok := matcher.MatchInto(line, scratch[:0]); ok {
+					matched++
+				}
+			}
+		}
+		b.ReportMetric(float64(len(matchLines)), "lines/op")
+		b.ReportMetric(float64(matched), "matched/op")
 	})
 }
 

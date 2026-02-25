@@ -8,14 +8,16 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/axiomhq/topk"
 )
 
 const (
 	payloadMagic                = "drn3"
-	payloadVersion              = byte(1)
+	payloadVersion              = byte(2)
 	adaptiveIDPathMinCandidates = 4
-	maxMatchTokens = 128 // lines with more tokens skip matching entirely
 )
 
 // Template is a trained log template.
@@ -172,19 +174,14 @@ func (m *Matcher) Match(line string) (templateID int, args []string, ok bool) {
 
 // MatchInto returns template id, extracted args into dst, and whether a match was found.
 func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []string, ok bool) {
-	if m == nil {
+	if m == nil || len(line) > m.cfg.MaxBytes {
 		return 0, nil, false
 	}
 	var tokens []string
 	if len(m.cfg.ExtraDelimiters) == 0 {
-		tokenCount := 1
-		for i := 0; i < len(line); i++ {
-			if line[i] == ' ' {
-				tokenCount++
-				if tokenCount > maxMatchTokens {
-					return 0, nil, false
-				}
-			}
+		tokenCount := 1 + strings.Count(line, " ")
+		if tokenCount > m.cfg.MaxTokens {
+			return 0, nil, false
 		}
 		if tokenCount >= len(m.flatTree.rootByLen) || m.flatTree.rootByLen[tokenCount] == 0 {
 			return 0, nil, false
@@ -203,21 +200,14 @@ func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []s
 
 // MatchID returns template id and whether a match was found.
 func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
-	if m == nil {
+	if m == nil || len(line) > m.cfg.MaxBytes {
 		return 0, false
 	}
 	var tokens []string
 	if len(m.cfg.ExtraDelimiters) == 0 {
-		// Fast reject: count spaces to estimate token count and reject
-		// lines that are too long or have no matching template length.
-		tokenCount := 1
-		for i := 0; i < len(line); i++ {
-			if line[i] == ' ' {
-				tokenCount++
-				if tokenCount > maxMatchTokens {
-					return 0, false
-				}
-			}
+		tokenCount := 1 + strings.Count(line, " ")
+		if tokenCount > m.cfg.MaxTokens {
+			return 0, false
 		}
 		if tokenCount >= len(m.flatTree.rootByLen) || m.flatTree.rootByLen[tokenCount] == 0 {
 			return 0, false
@@ -343,11 +333,11 @@ func (m *Matcher) UnmarshalBinary(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("read version: %w", err)
 	}
-	if ver != payloadVersion {
+	if ver != 1 && ver != 2 {
 		return fmt.Errorf("unsupported payload version: %d", ver)
 	}
 
-	cfg, err := readConfigBinary(r)
+	cfg, err := readConfigBinary(r, ver)
 	if err != nil {
 		return err
 	}
@@ -549,14 +539,15 @@ func tokenizeWhitespaceInto(content string, dst []string) []string {
 	if dst != nil {
 		dst = dst[:0]
 	}
-	start := 0
-	for i := 0; i < len(content); i++ {
-		if content[i] == ' ' {
-			dst = append(dst, content[start:i])
-			start = i + 1
+	for {
+		i := strings.IndexByte(content, ' ')
+		if i < 0 {
+			break
 		}
+		dst = append(dst, content[:i])
+		content = content[i+1:]
 	}
-	dst = append(dst, content[start:])
+	dst = append(dst, content)
 	return dst
 }
 
@@ -569,12 +560,8 @@ func extractArgsByIDInto(templateTokenIDs []uint64, lineTokens []string, paramID
 		return nil
 	}
 	limit := len(templateTokenIDs)
-	if len(lineTokens) < limit {
-		limit = len(lineTokens)
-	}
-	if paramCount > limit {
-		paramCount = limit
-	}
+	limit = min(limit, len(lineTokens))
+	limit = min(limit, paramCount)
 	args := dst[:0]
 	if cap(args) < paramCount {
 		args = make([]string, 0, paramCount)
@@ -637,6 +624,15 @@ func writeConfigBinary(w *bytes.Buffer, cfg Config) error {
 	if err := binary.Write(w, binary.LittleEndian, int32(cfg.MaxChildren)); err != nil {
 		return fmt.Errorf("write max children: %w", err)
 	}
+	if err := binary.Write(w, binary.LittleEndian, int32(cfg.MaxTokens)); err != nil {
+		return fmt.Errorf("write max tokens: %w", err)
+	}
+	if err := binary.Write(w, binary.LittleEndian, int32(cfg.MaxBytes)); err != nil {
+		return fmt.Errorf("write max bytes: %w", err)
+	}
+	if err := binary.Write(w, binary.LittleEndian, int32(cfg.TopK)); err != nil {
+		return fmt.Errorf("write top k: %w", err)
+	}
 	if err := writeString(w, cfg.ParamString); err != nil {
 		return err
 	}
@@ -661,7 +657,7 @@ func writeConfigBinary(w *bytes.Buffer, cfg Config) error {
 	return nil
 }
 
-func readConfigBinary(r *bytes.Reader) (Config, error) {
+func readConfigBinary(r *bytes.Reader, ver byte) (Config, error) {
 	var depth int32
 	if err := binary.Read(r, binary.LittleEndian, &depth); err != nil {
 		return Config{}, fmt.Errorf("read depth: %w", err)
@@ -677,6 +673,18 @@ func readConfigBinary(r *bytes.Reader) (Config, error) {
 	var maxChildren int32
 	if err := binary.Read(r, binary.LittleEndian, &maxChildren); err != nil {
 		return Config{}, fmt.Errorf("read max children: %w", err)
+	}
+	var maxTokens, maxBytes, topK int32
+	if ver >= 2 {
+		if err := binary.Read(r, binary.LittleEndian, &maxTokens); err != nil {
+			return Config{}, fmt.Errorf("read max tokens: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &maxBytes); err != nil {
+			return Config{}, fmt.Errorf("read max bytes: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &topK); err != nil {
+			return Config{}, fmt.Errorf("read top k: %w", err)
+		}
 	}
 	param, err := readString(r)
 	if err != nil {
@@ -715,6 +723,9 @@ func readConfigBinary(r *bytes.Reader) (Config, error) {
 		SimilarityThreshold:      simTh,
 		MatchThreshold:           matchTh,
 		MaxChildren:              int(maxChildren),
+		MaxTokens:                int(maxTokens),
+		MaxBytes:                 int(maxBytes),
+		TopK:                     int(topK),
 		ParamString:              param,
 		ParametrizeNumericTokens: flag == 1,
 		EnableMatchPrefilter:     prefilterFlag == 1,
@@ -796,6 +807,14 @@ func TrainWithConfig(samples []string, cfg Config) (*Matcher, error) {
 		m.addLogMessage(sample)
 	}
 	m.syncTemplatesFromClusters()
+
+	// Apply TopK pruning: keep only the highest-count templates
+	// using a min-heap of size K.
+	if norm.TopK > 0 && len(m.templates) > norm.TopK {
+		keep := topKTemplates(m.templates, norm.TopK)
+		return rebuildMatcherFromTemplates(norm, keep)
+	}
+
 	m.rebuildMatchPrefilter()
 	m.rebuildFlatTree()
 	m.rebuildMatchNeeded()
@@ -805,10 +824,46 @@ func TrainWithConfig(samples []string, cfg Config) (*Matcher, error) {
 	return m, nil
 }
 
+// topKTemplates returns the k templates with the highest Count using a
+// filtered space-saving sketch.
+func topKTemplates(templates []Template, k int) []Template {
+	if len(templates) <= k {
+		return templates
+	}
+
+	byID := make(map[string]Template, len(templates))
+	sk := topk.New(k)
+	for _, t := range templates {
+		key := strconv.Itoa(t.ID)
+		byID[key] = t
+		sk.Insert(key, t.Count)
+	}
+
+	winners := sk.Keys()
+	out := make([]Template, 0, len(winners))
+	for _, el := range winners {
+		if t, ok := byID[el.Key]; ok {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func rebuildMatcherFromTemplates(cfg Config, templates []Template) (*Matcher, error) {
+	var m Matcher
+	if err := m.rebuildFromTemplates(cfg, templates); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 func (m *Matcher) addLogMessage(content string) {
-	tokens := m.tokenizeForTrain(content)
-	if len(tokens) > maxMatchTokens {
+	if len(content) > m.cfg.MaxBytes {
 		return // skip oversized lines — they can never be matched
+	}
+	tokens := m.tokenizeForTrain(content)
+	if len(tokens) > m.cfg.MaxTokens {
+		return
 	}
 	tokenIDs := m.idsForTrainScratch(tokens)
 
@@ -956,7 +1011,6 @@ func (m *Matcher) fastMatchDrain(clusterIDs []int, tokenIDs []uint64, simTh floa
 	return nil
 }
 
-
 func (m *Matcher) fastMatchDrainAdaptive(clusterIDs []int, tokens []string, simTh float64) *drainCluster {
 	if len(clusterIDs) == 0 {
 		return nil
@@ -984,8 +1038,6 @@ func (m *Matcher) lookupTokenIDsPartial(tokens []string, dst []uint64) []uint64 
 	}
 	return dst
 }
-
-
 
 func (m *Matcher) addSeqToPrefixTreeDrain(cluster *drainCluster) {
 	tokenCount := len(cluster.tokenIDs)

@@ -8,6 +8,9 @@ type Config struct {
 	SimilarityThreshold      float64
 	MatchThreshold           float64
 	MaxChildren              int
+	MaxTokens                int
+	MaxBytes                 int
+	TopK                     int
 	ParamString              string
 	ParametrizeNumericTokens bool
 	EnableMatchPrefilter     bool
@@ -18,9 +21,12 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Depth:                    4,
-		SimilarityThreshold:      0.4,
+		SimilarityThreshold:      0.5,
 		MatchThreshold:           1.0,
 		MaxChildren:              100,
+		MaxTokens:                64,
+		MaxBytes:                 1024,
+		TopK:                     250,
 		ParamString:              "<*>",
 		ParametrizeNumericTokens: true,
 		EnableMatchPrefilter:     true,
@@ -45,6 +51,15 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if cfg.MaxChildren == 0 {
 		cfg.MaxChildren = def.MaxChildren
 	}
+	if cfg.MaxTokens == 0 {
+		cfg.MaxTokens = def.MaxTokens
+	}
+	if cfg.MaxBytes == 0 {
+		cfg.MaxBytes = def.MaxBytes
+	}
+	if cfg.TopK == 0 {
+		cfg.TopK = def.TopK
+	}
 	if cfg.ParamString == "" {
 		cfg.ParamString = def.ParamString
 	}
@@ -60,6 +75,15 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	if cfg.MaxChildren < 2 {
 		return Config{}, fmt.Errorf("max children must be >= 2")
+	}
+	if cfg.MaxTokens < 1 {
+		return Config{}, fmt.Errorf("max tokens must be >= 1")
+	}
+	if cfg.MaxBytes < 1 {
+		return Config{}, fmt.Errorf("max bytes must be >= 1")
+	}
+	if cfg.TopK < 1 {
+		return Config{}, fmt.Errorf("top k must be >= 1")
 	}
 	if cfg.ParamString == "" {
 		return Config{}, fmt.Errorf("param string must not be empty")
@@ -83,6 +107,9 @@ func isZeroConfig(cfg Config) bool {
 		cfg.SimilarityThreshold == 0 &&
 		cfg.MatchThreshold == 0 &&
 		cfg.MaxChildren == 0 &&
+		cfg.MaxTokens == 0 &&
+		cfg.MaxBytes == 0 &&
+		cfg.TopK == 0 &&
 		cfg.ParamString == "" &&
 		!cfg.ParametrizeNumericTokens &&
 		!cfg.EnableMatchPrefilter &&
