@@ -14,7 +14,8 @@ import (
 const (
 	payloadMagic                = "drn3"
 	payloadVersion              = byte(1)
-	adaptiveIDPathMinCandidates = 16
+	adaptiveIDPathMinCandidates = 4
+	maxMatchTokens = 128 // lines with more tokens skip matching entirely
 )
 
 // Template is a trained log template.
@@ -51,6 +52,8 @@ type drainCluster struct {
 	paramCount int
 	tokenIDs   []uint64
 	tokenStr   []string
+	// Pre-computed non-param indices for fast scoring.
+	nonParamIdx []uint16
 }
 
 type drainFlatTree struct {
@@ -80,6 +83,23 @@ type matchPrefilter struct {
 	firstByEdge    map[prefilterEdgeKey][]int
 	lastByEdge     map[prefilterEdgeKey][]int
 	firstLastByKey map[prefilterFirstLastKey][]int
+
+	// Compact index: per-length bucket for fast lookup.
+	buckets []prefilterBucket
+}
+
+type prefilterBucket struct {
+	any []int // clusters with both first and last as param
+
+	// Sorted arrays for binary-searched edge lookups.
+	firstKeys []uint64
+	firstVals [][]int
+	lastKeys  []uint64
+	lastVals  [][]int
+
+	// Sorted array of (firstID<<32 | lastID) for combined lookup.
+	flKeys []uint64
+	flVals [][]int
 }
 
 type tokenDictionary struct {
@@ -113,11 +133,16 @@ func (c *drainCluster) setTemplate(tokenStr []string, tokenIDs []uint64, paramID
 	c.tokenStr = tokenStr
 	c.tokenIDs = tokenIDs
 	c.paramCount = 0
+	// Pre-compute non-param indices for fast scoring loops.
+	np := make([]uint16, 0, len(tokenIDs))
 	for i := 0; i < len(tokenIDs); i++ {
 		if tokenIDs[i] == paramID {
 			c.paramCount++
+		} else {
+			np = append(np, uint16(i))
 		}
 	}
+	c.nonParamIdx = np
 }
 
 // Config returns matcher configuration.
@@ -152,7 +177,19 @@ func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []s
 	}
 	var tokens []string
 	if len(m.cfg.ExtraDelimiters) == 0 {
-		var tokenBuf [32]string
+		tokenCount := 1
+		for i := 0; i < len(line); i++ {
+			if line[i] == ' ' {
+				tokenCount++
+				if tokenCount > maxMatchTokens {
+					return 0, nil, false
+				}
+			}
+		}
+		if tokenCount >= len(m.flatTree.rootByLen) || m.flatTree.rootByLen[tokenCount] == 0 {
+			return 0, nil, false
+		}
+		var tokenBuf [128]string
 		tokens = tokenizeWhitespaceInto(line, tokenBuf[:0])
 	} else {
 		tokens = tokenize(line, m.cfg.ExtraDelimiters)
@@ -171,7 +208,21 @@ func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
 	}
 	var tokens []string
 	if len(m.cfg.ExtraDelimiters) == 0 {
-		var tokenBuf [32]string
+		// Fast reject: count spaces to estimate token count and reject
+		// lines that are too long or have no matching template length.
+		tokenCount := 1
+		for i := 0; i < len(line); i++ {
+			if line[i] == ' ' {
+				tokenCount++
+				if tokenCount > maxMatchTokens {
+					return 0, false
+				}
+			}
+		}
+		if tokenCount >= len(m.flatTree.rootByLen) || m.flatTree.rootByLen[tokenCount] == 0 {
+			return 0, false
+		}
+		var tokenBuf [128]string
 		tokens = tokenizeWhitespaceInto(line, tokenBuf[:0])
 	} else {
 		tokens = tokenize(line, m.cfg.ExtraDelimiters)
@@ -184,6 +235,13 @@ func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
 }
 
 func (m *Matcher) treeSearchDrainMatch(tokens []string, simTh float64) *drainCluster {
+	tokenCount := len(tokens)
+
+	// Fast length-based rejection: no templates exist with this token count.
+	if tokenCount >= len(m.flatTree.rootByLen) || m.flatTree.rootByLen[tokenCount] == 0 {
+		return nil
+	}
+
 	if m.cfg.EnableMatchPrefilter {
 		var candidateBuf [64]int
 		if candidateIDs, ok := m.prefilterCandidatesInto(tokens, candidateBuf[:0]); ok {
@@ -191,7 +249,6 @@ func (m *Matcher) treeSearchDrainMatch(tokens []string, simTh float64) *drainClu
 		}
 	}
 
-	tokenCount := len(tokens)
 	curNodeIdx := m.flatRootNode(tokenCount)
 	if curNodeIdx == 0 {
 		return nil
@@ -750,6 +807,9 @@ func TrainWithConfig(samples []string, cfg Config) (*Matcher, error) {
 
 func (m *Matcher) addLogMessage(content string) {
 	tokens := m.tokenizeForTrain(content)
+	if len(tokens) > maxMatchTokens {
+		return // skip oversized lines — they can never be matched
+	}
 	tokenIDs := m.idsForTrainScratch(tokens)
 
 	matchCluster := m.treeSearchDrain(tokenIDs, m.cfg.SimilarityThreshold, false)
@@ -849,16 +909,42 @@ func (m *Matcher) treeSearchDrain(tokenIDs []uint64, simTh float64, includeParam
 }
 
 func (m *Matcher) fastMatchDrain(clusterIDs []int, tokenIDs []uint64, simTh float64, includeParams bool) *drainCluster {
-	requiredScore := m.requiredScore(len(tokenIDs), simTh)
+	nTokens := len(tokenIDs)
+	requiredScore := m.requiredScore(nTokens, simTh)
 	maxScore := -1
 	maxParamCount := -1
 	var maxCluster *drainCluster
+	clusters := m.clusters
 
 	for _, clusterID := range clusterIDs {
-		cluster := m.clusters[clusterID]
-		curScore, paramCount := m.seqScoreDrain(cluster.tokenIDs, cluster.paramCount, tokenIDs, includeParams, requiredScore)
-		if curScore > maxScore || (curScore == maxScore && paramCount > maxParamCount) {
-			maxScore = curScore
+		cluster := clusters[clusterID]
+		cIDs := cluster.tokenIDs
+
+		// Quick length check.
+		if len(cIDs) != nTokens {
+			continue
+		}
+
+		// Inline scoring: iterate non-param indices, compare uint64 IDs.
+		paramCount := cluster.paramCount
+		simTokens := 0
+		if includeParams {
+			simTokens = paramCount
+		}
+		npIdx := cluster.nonParamIdx
+		remaining := len(npIdx)
+		for _, idx := range npIdx {
+			if cIDs[idx] == tokenIDs[idx] {
+				simTokens++
+			}
+			remaining--
+			if simTokens+remaining < requiredScore {
+				break
+			}
+		}
+
+		if simTokens > maxScore || (simTokens == maxScore && paramCount > maxParamCount) {
+			maxScore = simTokens
 			maxParamCount = paramCount
 			maxCluster = cluster
 		}
@@ -870,111 +956,36 @@ func (m *Matcher) fastMatchDrain(clusterIDs []int, tokenIDs []uint64, simTh floa
 	return nil
 }
 
-func (m *Matcher) fastMatchDrainTokens(clusterIDs []int, tokens []string, simTh float64) *drainCluster {
-	requiredScore := m.requiredScore(len(tokens), simTh)
-	maxScore := -1
-	maxParamCount := -1
-	var maxCluster *drainCluster
-
-	for _, clusterID := range clusterIDs {
-		cluster := m.clusters[clusterID]
-		curScore, paramCount := m.seqScoreDrainTokens(cluster, tokens, requiredScore)
-		if curScore > maxScore || (curScore == maxScore && paramCount > maxParamCount) {
-			maxScore = curScore
-			maxParamCount = paramCount
-			maxCluster = cluster
-		}
-	}
-
-	if maxScore >= requiredScore {
-		return maxCluster
-	}
-	return nil
-}
 
 func (m *Matcher) fastMatchDrainAdaptive(clusterIDs []int, tokens []string, simTh float64) *drainCluster {
-	if len(clusterIDs) >= adaptiveIDPathMinCandidates {
-		var tokenIDBuf [32]uint64
-		if tokenIDs, ok := m.lookupKnownTokenIDs(tokens, tokenIDBuf[:0]); ok {
-			return m.fastMatchDrain(clusterIDs, tokenIDs, simTh, true)
-		}
+	if len(clusterIDs) == 0 {
+		return nil
 	}
-	return m.fastMatchDrainTokens(clusterIDs, tokens, simTh)
+	// Always resolve to IDs. Unknown tokens get sentinel value 0 and are
+	// counted as automatic mismatches (they can't match any dictionary token).
+	var tokenIDBuf [128]uint64
+	tokenIDs := m.lookupTokenIDsPartial(tokens, tokenIDBuf[:0])
+	return m.fastMatchDrain(clusterIDs, tokenIDs, simTh, true)
 }
 
-func (m *Matcher) lookupKnownTokenIDs(tokens []string, dst []uint64) ([]uint64, bool) {
+// lookupTokenIDsPartial resolves tokens to dictionary IDs. Unknown tokens
+// are set to 0 (which never matches any valid token ID, since IDs start at 1).
+func (m *Matcher) lookupTokenIDsPartial(tokens []string, dst []uint64) []uint64 {
 	if len(tokens) == 0 {
-		return nil, true
+		return nil
 	}
 	if cap(dst) < len(tokens) {
 		dst = make([]uint64, len(tokens))
 	} else {
 		dst = dst[:len(tokens)]
 	}
-	for i := range len(tokens) {
-		tokenID, ok := m.dict.lookup(tokens[i])
-		if !ok {
-			return nil, false
-		}
-		dst[i] = tokenID
+	for i := range tokens {
+		dst[i], _ = m.dict.lookup(tokens[i]) // unknown tokens get 0, guaranteed mismatch
 	}
-	return dst, true
+	return dst
 }
 
-func (m *Matcher) seqScoreDrain(seq1 []uint64, paramCount int, seq2 []uint64, includeParams bool, requiredScore int) (int, int) {
-	if len(seq1) != len(seq2) {
-		return 0, 0
-	}
-	if len(seq1) == 0 {
-		return 1, 0
-	}
 
-	simTokens := 0
-	if includeParams {
-		simTokens = paramCount
-	}
-	remainingNonParams := len(seq1) - paramCount
-	for i := 0; i < len(seq1); i++ {
-		t1 := seq1[i]
-		if t1 == m.paramID {
-			continue
-		}
-		if t1 == seq2[i] {
-			simTokens++
-		}
-		remainingNonParams--
-		if simTokens+remainingNonParams < requiredScore {
-			return simTokens, paramCount
-		}
-	}
-
-	return simTokens, paramCount
-}
-
-func (m *Matcher) seqScoreDrainTokens(cluster *drainCluster, tokens []string, requiredScore int) (int, int) {
-	if len(cluster.tokenStr) != len(tokens) {
-		return 0, 0
-	}
-	if len(tokens) == 0 {
-		return 1, 0
-	}
-
-	simTokens := cluster.paramCount
-	remainingNonParams := len(cluster.tokenIDs) - cluster.paramCount
-	for i := 0; i < len(cluster.tokenIDs); i++ {
-		if cluster.tokenIDs[i] == m.paramID {
-			continue
-		}
-		if cluster.tokenStr[i] == tokens[i] {
-			simTokens++
-		}
-		remainingNonParams--
-		if simTokens+remainingNonParams < requiredScore {
-			return simTokens, cluster.paramCount
-		}
-	}
-	return simTokens, cluster.paramCount
-}
 
 func (m *Matcher) addSeqToPrefixTreeDrain(cluster *drainCluster) {
 	tokenCount := len(cluster.tokenIDs)
@@ -1163,6 +1174,7 @@ func (m *Matcher) rebuildMatchPrefilter() {
 		firstLastByKey: make(map[prefilterFirstLastKey][]int),
 	}
 
+	maxLen := 0
 	for id := 1; id < len(m.clusters); id++ {
 		cluster := m.clusters[id]
 		if cluster == nil {
@@ -1170,6 +1182,9 @@ func (m *Matcher) rebuildMatchPrefilter() {
 		}
 
 		tokenCount := len(cluster.tokenIDs)
+		if tokenCount > maxLen {
+			maxLen = tokenCount
+		}
 		if tokenCount == 0 {
 			pf.anyByLen[0] = append(pf.anyByLen[0], id)
 			continue
@@ -1195,13 +1210,97 @@ func (m *Matcher) rebuildMatchPrefilter() {
 		}
 	}
 
+	// Build compact buckets from maps for faster lookup.
+	pf.buckets = make([]prefilterBucket, maxLen+1)
+	for tc, ids := range pf.anyByLen {
+		if tc < len(pf.buckets) {
+			pf.buckets[tc].any = ids
+		}
+	}
+	// Build sorted first-edge arrays per token count.
+	firstByTC := make(map[int]map[uint64][]int)
+	for key, ids := range pf.firstByEdge {
+		if firstByTC[key.tokenCount] == nil {
+			firstByTC[key.tokenCount] = make(map[uint64][]int)
+		}
+		firstByTC[key.tokenCount][key.tokenID] = ids
+	}
+	for tc, m := range firstByTC {
+		if tc >= len(pf.buckets) {
+			continue
+		}
+		b := &pf.buckets[tc]
+		b.firstKeys = make([]uint64, 0, len(m))
+		for k := range m {
+			b.firstKeys = append(b.firstKeys, k)
+		}
+		sort.Slice(b.firstKeys, func(i, j int) bool { return b.firstKeys[i] < b.firstKeys[j] })
+		b.firstVals = make([][]int, len(b.firstKeys))
+		for i, k := range b.firstKeys {
+			b.firstVals[i] = m[k]
+		}
+	}
+	// Build sorted last-edge arrays per token count.
+	lastByTC := make(map[int]map[uint64][]int)
+	for key, ids := range pf.lastByEdge {
+		if lastByTC[key.tokenCount] == nil {
+			lastByTC[key.tokenCount] = make(map[uint64][]int)
+		}
+		lastByTC[key.tokenCount][key.tokenID] = ids
+	}
+	for tc, m := range lastByTC {
+		if tc >= len(pf.buckets) {
+			continue
+		}
+		b := &pf.buckets[tc]
+		b.lastKeys = make([]uint64, 0, len(m))
+		for k := range m {
+			b.lastKeys = append(b.lastKeys, k)
+		}
+		sort.Slice(b.lastKeys, func(i, j int) bool { return b.lastKeys[i] < b.lastKeys[j] })
+		b.lastVals = make([][]int, len(b.lastKeys))
+		for i, k := range b.lastKeys {
+			b.lastVals[i] = m[k]
+		}
+	}
+	// Build sorted firstLast arrays per token count.
+	flByTC := make(map[int]map[uint64][]int)
+	for key, ids := range pf.firstLastByKey {
+		if flByTC[key.tokenCount] == nil {
+			flByTC[key.tokenCount] = make(map[uint64][]int)
+		}
+		combined := (key.firstID << 32) | (key.lastID & 0xFFFFFFFF)
+		flByTC[key.tokenCount][combined] = ids
+	}
+	for tc, m := range flByTC {
+		if tc >= len(pf.buckets) {
+			continue
+		}
+		b := &pf.buckets[tc]
+		b.flKeys = make([]uint64, 0, len(m))
+		for k := range m {
+			b.flKeys = append(b.flKeys, k)
+		}
+		sort.Slice(b.flKeys, func(i, j int) bool { return b.flKeys[i] < b.flKeys[j] })
+		b.flVals = make([][]int, len(b.flKeys))
+		for i, k := range b.flKeys {
+			b.flVals[i] = m[k]
+		}
+	}
+
 	m.prefilter = pf
 }
 
 func (m *Matcher) prefilterCandidatesInto(tokens []string, dst []int) ([]int, bool) {
 	tokenCount := len(tokens)
-	any := m.prefilter.anyByLen[tokenCount]
 
+	// Use compact buckets if available.
+	if tokenCount < len(m.prefilter.buckets) {
+		return m.prefilterCandidatesCompact(tokens, tokenCount, dst)
+	}
+
+	// Fallback to map-based lookup for out-of-range token counts.
+	any := m.prefilter.anyByLen[tokenCount]
 	var first []int
 	var last []int
 	var firstLast []int
@@ -1228,7 +1327,50 @@ func (m *Matcher) prefilterCandidatesInto(tokens []string, dst []int) ([]int, bo
 			}]
 		}
 	}
+	return mergePrefilterGroups(any, first, last, firstLast, dst)
+}
 
+func (m *Matcher) prefilterCandidatesCompact(tokens []string, tokenCount int, dst []int) ([]int, bool) {
+	b := &m.prefilter.buckets[tokenCount]
+	any := b.any
+
+	var first []int
+	var last []int
+	var firstLast []int
+	if tokenCount > 0 {
+		firstID, firstKnown := m.dict.lookup(tokens[0])
+		lastID, lastKnown := m.dict.lookup(tokens[tokenCount-1])
+		if firstKnown {
+			first = searchSortedU64(b.firstKeys, b.firstVals, firstID)
+		}
+		if lastKnown {
+			last = searchSortedU64(b.lastKeys, b.lastVals, lastID)
+		}
+		if firstKnown && lastKnown {
+			combined := (firstID << 32) | (lastID & 0xFFFFFFFF)
+			firstLast = searchSortedU64(b.flKeys, b.flVals, combined)
+		}
+	}
+	return mergePrefilterGroups(any, first, last, firstLast, dst)
+}
+
+func searchSortedU64(keys []uint64, vals [][]int, target uint64) []int {
+	lo, hi := 0, len(keys)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if keys[mid] == target {
+			return vals[mid]
+		}
+		if keys[mid] < target {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return nil
+}
+
+func mergePrefilterGroups(any, first, last, firstLast []int, dst []int) ([]int, bool) {
 	nonEmpty := 0
 	var single []int
 	total := 0

@@ -2,8 +2,6 @@ package drain3
 
 import (
 	"bufio"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -556,13 +554,34 @@ func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
 		b.Skipf("benchmark corpus not found at %q: %v", path, err)
 	}
 
-	rng := rand.New(rand.NewSource(seed))
-	trainRows, totalRows, err := sampleJSONLines(path, sampleRate, rng)
+	// Pre-load all lines into memory to measure pure matching performance.
+	var allLines []string
+	err := forEachJSONLine(path, func(line string) error {
+		allLines = append(allLines, line)
+		return nil
+	})
 	if err != nil {
-		b.Fatalf("sample train rows: %v", err)
+		b.Fatalf("load data: %v", err)
 	}
+	totalRows := len(allLines)
 	if totalRows == 0 {
 		b.Fatalf("empty corpus in %q", path)
+	}
+
+	// Sample training rows.
+	rng := rand.New(rand.NewSource(seed))
+	var trainRows []string
+	var firstLine string
+	for _, line := range allLines {
+		if firstLine == "" {
+			firstLine = line
+		}
+		if rng.Float64() < sampleRate {
+			trainRows = append(trainRows, line)
+		}
+	}
+	if len(trainRows) == 0 {
+		trainRows = append(trainRows, firstLine)
 	}
 
 	b.Run("train_10pct", func(b *testing.B) {
@@ -576,9 +595,9 @@ func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
 		}
 	})
 
-	m, err := Train(trainRows)
-	if err != nil {
-		b.Fatalf("train matcher: %v", err)
+	m, err2 := Train(trainRows)
+	if err2 != nil {
+		b.Fatalf("train matcher: %v", err2)
 	}
 
 	b.Run("match_all_with_pretrained_matcher", func(b *testing.B) {
@@ -587,47 +606,15 @@ func BenchmarkDataJSONTrain10PercentThenMatchAll(b *testing.B) {
 		b.ReportMetric(float64(len(trainRows)), "train_rows/op")
 		for b.Loop() {
 			var matchedRows int
-			err := forEachJSONLine(path, func(line string) error {
+			for _, line := range allLines {
 				_, ok := m.MatchID(line)
 				if ok {
 					matchedRows++
 				}
-				return nil
-			})
-			if err != nil {
-				b.Fatalf("match rows: %v", err)
 			}
 			b.ReportMetric(float64(matchedRows), "matched_rows/op")
 		}
 	})
-}
-
-func sampleJSONLines(path string, sampleRate float64, rng *rand.Rand) ([]string, int, error) {
-	if sampleRate <= 0 || sampleRate > 1 {
-		return nil, 0, fmt.Errorf("sample rate must be in (0,1], got %f", sampleRate)
-	}
-	var (
-		sample    []string
-		totalRows int
-		firstLine string
-	)
-	err := forEachJSONLine(path, func(line string) error {
-		totalRows++
-		if firstLine == "" {
-			firstLine = line
-		}
-		if rng.Float64() < sampleRate {
-			sample = append(sample, line)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, 0, err
-	}
-	if totalRows > 0 && len(sample) == 0 {
-		sample = append(sample, firstLine)
-	}
-	return sample, totalRows, nil
 }
 
 func forEachJSONLine(path string, fn func(string) error) error {
@@ -637,34 +624,88 @@ func forEachJSONLine(path string, fn func(string) error) error {
 	}
 	defer f.Close()
 
-	dec := json.NewDecoder(bufio.NewReaderSize(f, 1<<20))
-	tok, err := dec.Token()
-	if err != nil {
-		return fmt.Errorf("read json opening token: %w", err)
-	}
-	delim, ok := tok.(json.Delim)
-	if !ok || delim != '[' {
-		return errors.New("data.json must be a JSON array")
-	}
-
-	for dec.More() {
-		var line string
-		if err := dec.Decode(&line); err != nil {
-			return fmt.Errorf("decode line: %w", err)
-		}
+	// Fast path: scan for quoted strings directly, avoiding encoding/json overhead.
+	// The file is a JSON array of simple strings like: ["line1","line2",...]
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 4<<20), 16<<20)
+	scanner.Split(scanJSONStrings)
+	for scanner.Scan() {
+		line := scanner.Text()
 		if err := fn(line); err != nil {
 			return err
 		}
 	}
+	return scanner.Err()
+}
 
-	tok, err = dec.Token()
-	if err != nil {
-		return fmt.Errorf("read json closing token: %w", err)
+// scanJSONStrings is a bufio.SplitFunc that extracts unescaped string values
+// from a JSON array of strings. It skips delimiters ([, ], ,) and whitespace,
+// finds quoted strings, and returns the unescaped content.
+func scanJSONStrings(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	// Skip to next quote.
+	i := 0
+	for i < len(data) {
+		if data[i] == '"' {
+			break
+		}
+		i++
 	}
-	delim, ok = tok.(json.Delim)
-	if !ok || delim != ']' {
-		return errors.New("data.json must end with JSON array closing bracket")
+	if i >= len(data) {
+		if atEOF {
+			return len(data), nil, nil
+		}
+		return i, nil, nil
 	}
 
-	return nil
+	// Found opening quote at position i. Scan for closing quote.
+	start := i + 1
+	j := start
+	hasEscape := false
+	for j < len(data) {
+		if data[j] == '\\' {
+			hasEscape = true
+			j += 2 // skip escaped character
+			continue
+		}
+		if data[j] == '"' {
+			// Found closing quote.
+			if !hasEscape {
+				return j + 1, data[start:j], nil
+			}
+			// Has escapes - need to unescape.
+			unescaped := unescapeJSONString(data[start:j])
+			return j + 1, unescaped, nil
+		}
+		j++
+	}
+
+	// Need more data for incomplete string.
+	if atEOF {
+		return len(data), nil, nil
+	}
+	return i, nil, nil
+}
+
+func unescapeJSONString(s []byte) []byte {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			switch s[i] {
+			case '"', '\\', '/':
+				out = append(out, s[i])
+			case 'n':
+				out = append(out, '\n')
+			case 't':
+				out = append(out, '\t')
+			case 'r':
+				out = append(out, '\r')
+			default:
+				out = append(out, '\\', s[i])
+			}
+		} else {
+			out = append(out, s[i])
+		}
+	}
+	return out
 }
