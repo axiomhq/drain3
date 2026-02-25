@@ -1089,7 +1089,6 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 	}
 }
 
-
 func TestTemplateHitDistribution(t *testing.T) {
 	const (
 		path       = "strs.json"
@@ -1334,4 +1333,68 @@ func unescapeJSONString(s []byte) []byte {
 		}
 	}
 	return out
+}
+
+func tokenizeManual(content string, dst []string) []string {
+	if content == "" {
+		return nil
+	}
+	if dst != nil {
+		dst = dst[:0]
+	}
+	start := 0
+	for i := 0; i < len(content); i++ {
+		if content[i] == ' ' {
+			dst = append(dst, content[start:i])
+			start = i + 1
+		}
+	}
+	dst = append(dst, content[start:])
+	return dst
+}
+
+func tokenizeIndexByte(content string, dst []string) []string {
+	if content == "" {
+		return nil
+	}
+	if dst != nil {
+		dst = dst[:0]
+	}
+	for {
+		i := strings.IndexByte(content, ' ')
+		if i < 0 {
+			break
+		}
+		dst = append(dst, content[:i])
+		content = content[i+1:]
+	}
+	dst = append(dst, content)
+	return dst
+}
+
+func BenchmarkCrossover(b *testing.B) {
+	// Generate strings of various lengths with spaces every ~8 bytes
+	for _, size := range []int{32, 64, 128, 256, 512, 1024} {
+		var sb strings.Builder
+		for sb.Len() < size {
+			if sb.Len() > 0 {
+				sb.WriteByte(' ')
+			}
+			sb.WriteString("token12")
+		}
+		line := sb.String()
+
+		b.Run(fmt.Sprintf("manual_%d", size), func(b *testing.B) {
+			var buf [128]string
+			for b.Loop() {
+				tokenizeManual(line, buf[:0])
+			}
+		})
+		b.Run(fmt.Sprintf("indexbyte_%d", size), func(b *testing.B) {
+			var buf [128]string
+			for b.Loop() {
+				tokenizeIndexByte(line, buf[:0])
+			}
+		})
+	}
 }
