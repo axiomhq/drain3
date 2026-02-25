@@ -304,6 +304,47 @@ func TestMatchIsSensitiveToRepeatedSpaces(t *testing.T) {
 	}
 }
 
+func TestPrefilterParityWithTreeSearch(t *testing.T) {
+	samples := []string{
+		"a mid c",
+		"b mid c",
+		"x edge y",
+		"x edge z",
+		"p core q",
+		"r core s",
+		"literal line",
+	}
+
+	withPrefilter, err := Train(samples)
+	if err != nil {
+		t.Fatalf("train with prefilter failed: %v", err)
+	}
+
+	cfgNoPrefilter := withPrefilter.Config()
+	cfgNoPrefilter.EnableMatchPrefilter = false
+	withoutPrefilter, err := TrainWithConfig(samples, cfgNoPrefilter)
+	if err != nil {
+		t.Fatalf("train without prefilter failed: %v", err)
+	}
+
+	queries := []string{
+		"u mid c",  // first wildcard + concrete last
+		"x edge t", // concrete first + wildcard last
+		"u core t", // wildcard first + wildcard last
+		"literal line",
+		"literal  line",
+		"no match line",
+	}
+
+	for _, q := range queries {
+		idA, argsA, okA := withPrefilter.Match(q)
+		idB, argsB, okB := withoutPrefilter.Match(q)
+		if okA != okB || idA != idB || !reflect.DeepEqual(argsA, argsB) {
+			t.Fatalf("prefilter parity mismatch for %q: with=(%d,%v,%v) without=(%d,%v,%v)", q, idA, argsA, okA, idB, argsB, okB)
+		}
+	}
+}
+
 func TestColumnStyleClusterRemapFlow(t *testing.T) {
 	const invalidTemplateID = ^uint32(0)
 

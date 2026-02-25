@@ -10,6 +10,7 @@ type Config struct {
 	MaxChildren              int
 	ParamString              string
 	ParametrizeNumericTokens bool
+	EnableMatchPrefilter     bool
 	ExtraDelimiters          []string
 }
 
@@ -22,6 +23,7 @@ func DefaultConfig() Config {
 		MaxChildren:              100,
 		ParamString:              "<*>",
 		ParametrizeNumericTokens: true,
+		EnableMatchPrefilter:     true,
 	}
 }
 
@@ -83,5 +85,6 @@ func isZeroConfig(cfg Config) bool {
 		cfg.MaxChildren == 0 &&
 		cfg.ParamString == "" &&
 		!cfg.ParametrizeNumericTokens &&
+		!cfg.EnableMatchPrefilter &&
 		len(cfg.ExtraDelimiters) == 0
 }

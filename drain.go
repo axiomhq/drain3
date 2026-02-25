@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 )
@@ -27,11 +28,14 @@ type Template struct {
 type Matcher struct {
 	cfg         Config
 	templates   []Template
-	root        map[int]*drainNode
+	rootByLen   []*drainNode
+	flatTree    drainFlatTree
+	prefilter   matchPrefilter
 	clusters    []*drainCluster
 	dict        tokenDictionary
 	paramID     uint64
 	nextCluster int
+	matchNeeded []int
 	scratchIDs  []uint64
 	scratchTok  []string
 }
@@ -49,6 +53,35 @@ type drainCluster struct {
 	tokenStr   []string
 }
 
+type drainFlatTree struct {
+	rootByLen []uint32
+	nodes     []drainFlatNode
+}
+
+type drainFlatNode struct {
+	childKeys    []uint64
+	childIndexes []uint32
+	clusterIDs   []int
+}
+
+type prefilterEdgeKey struct {
+	tokenCount int
+	tokenID    uint64
+}
+
+type prefilterFirstLastKey struct {
+	tokenCount int
+	firstID    uint64
+	lastID     uint64
+}
+
+type matchPrefilter struct {
+	anyByLen       map[int][]int
+	firstByEdge    map[prefilterEdgeKey][]int
+	lastByEdge     map[prefilterEdgeKey][]int
+	firstLastByKey map[prefilterFirstLastKey][]int
+}
+
 type tokenDictionary struct {
 	ids    map[string]uint64
 	nextID uint64
@@ -57,12 +90,12 @@ type tokenDictionary struct {
 func newMatcher(cfg Config) *Matcher {
 	m := &Matcher{
 		cfg:         cfg,
-		root:        make(map[int]*drainNode),
 		clusters:    make([]*drainCluster, 1),
 		nextCluster: 1,
 	}
 	m.dict.init()
 	m.paramID = m.dict.intern(cfg.ParamString)
+	m.rebuildMatchNeeded()
 	return m
 }
 
@@ -151,11 +184,19 @@ func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
 }
 
 func (m *Matcher) treeSearchDrainMatch(tokens []string, simTh float64) *drainCluster {
+	if m.cfg.EnableMatchPrefilter {
+		var candidateBuf [64]int
+		if candidateIDs, ok := m.prefilterCandidatesInto(tokens, candidateBuf[:0]); ok {
+			return m.fastMatchDrainAdaptive(candidateIDs, tokens, simTh)
+		}
+	}
+
 	tokenCount := len(tokens)
-	curNode := m.root[tokenCount]
-	if curNode == nil {
+	curNodeIdx := m.flatRootNode(tokenCount)
+	if curNodeIdx == 0 {
 		return nil
 	}
+	curNode := &m.flatTree.nodes[curNodeIdx]
 
 	if tokenCount == 0 {
 		if len(curNode.clusterIDs) == 0 {
@@ -171,18 +212,18 @@ func (m *Matcher) treeSearchDrainMatch(tokens []string, simTh float64) *drainClu
 			break
 		}
 
-		nextNode := (*drainNode)(nil)
+		nextNodeIdx := uint32(0)
 		if tokenID, ok := m.dict.lookup(tokens[i]); ok {
-			nextNode = curNode.children[tokenID]
+			nextNodeIdx = flatNodeChild(curNode, tokenID)
 		}
-		if nextNode == nil {
-			nextNode = curNode.children[m.paramID]
+		if nextNodeIdx == 0 {
+			nextNodeIdx = flatNodeChild(curNode, m.paramID)
 		}
-		if nextNode == nil {
+		if nextNodeIdx == 0 {
 			return nil
 		}
 
-		curNode = nextNode
+		curNode = &m.flatTree.nodes[nextNodeIdx]
 		curDepth++
 	}
 
@@ -359,6 +400,12 @@ func (m *Matcher) rebuildFromTemplates(cfg Config, templates []Template) error {
 		}
 	}
 	next.syncTemplatesFromClusters()
+	next.rebuildMatchPrefilter()
+	next.rebuildFlatTree()
+	next.rebuildMatchNeeded()
+	if err := next.validateClusterReferences(); err != nil {
+		return err
+	}
 
 	*m = *next
 	return nil
@@ -541,6 +588,11 @@ func writeConfigBinary(w *bytes.Buffer, cfg Config) error {
 	} else {
 		w.WriteByte(0)
 	}
+	if cfg.EnableMatchPrefilter {
+		w.WriteByte(1)
+	} else {
+		w.WriteByte(0)
+	}
 	if err := writeUvarint(w, uint64(len(cfg.ExtraDelimiters))); err != nil {
 		return err
 	}
@@ -577,6 +629,10 @@ func readConfigBinary(r *bytes.Reader) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read numeric parameterization flag: %w", err)
 	}
+	prefilterFlag, err := r.ReadByte()
+	if err != nil {
+		return Config{}, fmt.Errorf("read prefilter enable flag: %w", err)
+	}
 	nDelims, err := readUvarint(r)
 	if err != nil {
 		return Config{}, fmt.Errorf("read delimiter count: %w", err)
@@ -604,6 +660,7 @@ func readConfigBinary(r *bytes.Reader) (Config, error) {
 		MaxChildren:              int(maxChildren),
 		ParamString:              param,
 		ParametrizeNumericTokens: flag == 1,
+		EnableMatchPrefilter:     prefilterFlag == 1,
 		ExtraDelimiters:          delims,
 	}
 	return normalizeConfig(cfg)
@@ -682,6 +739,12 @@ func TrainWithConfig(samples []string, cfg Config) (*Matcher, error) {
 		m.addLogMessage(sample)
 	}
 	m.syncTemplatesFromClusters()
+	m.rebuildMatchPrefilter()
+	m.rebuildFlatTree()
+	m.rebuildMatchNeeded()
+	if err := m.validateClusterReferences(); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -747,7 +810,7 @@ func (m *Matcher) clusterByID(id int) *drainCluster {
 
 func (m *Matcher) treeSearchDrain(tokenIDs []uint64, simTh float64, includeParams bool) *drainCluster {
 	tokenCount := len(tokenIDs)
-	curNode := m.root[tokenCount]
+	curNode := m.mutableRootNode(tokenCount)
 	if curNode == nil {
 		return nil
 	}
@@ -786,17 +849,14 @@ func (m *Matcher) treeSearchDrain(tokenIDs []uint64, simTh float64, includeParam
 }
 
 func (m *Matcher) fastMatchDrain(clusterIDs []int, tokenIDs []uint64, simTh float64, includeParams bool) *drainCluster {
-	requiredScore := simTh * float64(len(tokenIDs))
+	requiredScore := m.requiredScore(len(tokenIDs), simTh)
 	maxScore := -1
 	maxParamCount := -1
 	var maxCluster *drainCluster
 
 	for _, clusterID := range clusterIDs {
-		cluster := m.clusterByID(clusterID)
-		if cluster == nil {
-			continue
-		}
-		curScore, paramCount := m.seqScoreDrain(cluster.tokenIDs, cluster.paramCount, tokenIDs, includeParams)
+		cluster := m.clusters[clusterID]
+		curScore, paramCount := m.seqScoreDrain(cluster.tokenIDs, cluster.paramCount, tokenIDs, includeParams, requiredScore)
 		if curScore > maxScore || (curScore == maxScore && paramCount > maxParamCount) {
 			maxScore = curScore
 			maxParamCount = paramCount
@@ -804,24 +864,21 @@ func (m *Matcher) fastMatchDrain(clusterIDs []int, tokenIDs []uint64, simTh floa
 		}
 	}
 
-	if float64(maxScore) >= requiredScore {
+	if maxScore >= requiredScore {
 		return maxCluster
 	}
 	return nil
 }
 
 func (m *Matcher) fastMatchDrainTokens(clusterIDs []int, tokens []string, simTh float64) *drainCluster {
-	requiredScore := simTh * float64(len(tokens))
+	requiredScore := m.requiredScore(len(tokens), simTh)
 	maxScore := -1
 	maxParamCount := -1
 	var maxCluster *drainCluster
 
 	for _, clusterID := range clusterIDs {
-		cluster := m.clusterByID(clusterID)
-		if cluster == nil {
-			continue
-		}
-		curScore, paramCount := m.seqScoreDrainTokens(cluster, tokens)
+		cluster := m.clusters[clusterID]
+		curScore, paramCount := m.seqScoreDrainTokens(cluster, tokens, requiredScore)
 		if curScore > maxScore || (curScore == maxScore && paramCount > maxParamCount) {
 			maxScore = curScore
 			maxParamCount = paramCount
@@ -829,7 +886,7 @@ func (m *Matcher) fastMatchDrainTokens(clusterIDs []int, tokens []string, simTh 
 		}
 	}
 
-	if float64(maxScore) >= requiredScore {
+	if maxScore >= requiredScore {
 		return maxCluster
 	}
 	return nil
@@ -864,7 +921,7 @@ func (m *Matcher) lookupKnownTokenIDs(tokens []string, dst []uint64) ([]uint64, 
 	return dst, true
 }
 
-func (m *Matcher) seqScoreDrain(seq1 []uint64, paramCount int, seq2 []uint64, includeParams bool) (int, int) {
+func (m *Matcher) seqScoreDrain(seq1 []uint64, paramCount int, seq2 []uint64, includeParams bool, requiredScore int) (int, int) {
 	if len(seq1) != len(seq2) {
 		return 0, 0
 	}
@@ -873,6 +930,10 @@ func (m *Matcher) seqScoreDrain(seq1 []uint64, paramCount int, seq2 []uint64, in
 	}
 
 	simTokens := 0
+	if includeParams {
+		simTokens = paramCount
+	}
+	remainingNonParams := len(seq1) - paramCount
 	for i := 0; i < len(seq1); i++ {
 		t1 := seq1[i]
 		if t1 == m.paramID {
@@ -881,15 +942,16 @@ func (m *Matcher) seqScoreDrain(seq1 []uint64, paramCount int, seq2 []uint64, in
 		if t1 == seq2[i] {
 			simTokens++
 		}
-	}
-	if includeParams {
-		simTokens += paramCount
+		remainingNonParams--
+		if simTokens+remainingNonParams < requiredScore {
+			return simTokens, paramCount
+		}
 	}
 
 	return simTokens, paramCount
 }
 
-func (m *Matcher) seqScoreDrainTokens(cluster *drainCluster, tokens []string) (int, int) {
+func (m *Matcher) seqScoreDrainTokens(cluster *drainCluster, tokens []string, requiredScore int) (int, int) {
 	if len(cluster.tokenStr) != len(tokens) {
 		return 0, 0
 	}
@@ -898,6 +960,7 @@ func (m *Matcher) seqScoreDrainTokens(cluster *drainCluster, tokens []string) (i
 	}
 
 	simTokens := cluster.paramCount
+	remainingNonParams := len(cluster.tokenIDs) - cluster.paramCount
 	for i := 0; i < len(cluster.tokenIDs); i++ {
 		if cluster.tokenIDs[i] == m.paramID {
 			continue
@@ -905,16 +968,20 @@ func (m *Matcher) seqScoreDrainTokens(cluster *drainCluster, tokens []string) (i
 		if cluster.tokenStr[i] == tokens[i] {
 			simTokens++
 		}
+		remainingNonParams--
+		if simTokens+remainingNonParams < requiredScore {
+			return simTokens, cluster.paramCount
+		}
 	}
 	return simTokens, cluster.paramCount
 }
 
 func (m *Matcher) addSeqToPrefixTreeDrain(cluster *drainCluster) {
 	tokenCount := len(cluster.tokenIDs)
-	firstLayerNode := m.root[tokenCount]
+	firstLayerNode := m.mutableRootNode(tokenCount)
 	if firstLayerNode == nil {
 		firstLayerNode = newDrainNode()
-		m.root[tokenCount] = firstLayerNode
+		m.setMutableRootNode(tokenCount, firstLayerNode)
 	}
 
 	curNode := firstLayerNode
@@ -969,4 +1036,296 @@ func (m *Matcher) addSeqToPrefixTreeDrain(cluster *drainCluster) {
 		curNode = nextNode
 		curDepth++
 	}
+}
+
+func (m *Matcher) mutableRootNode(tokenCount int) *drainNode {
+	if tokenCount < 0 || tokenCount >= len(m.rootByLen) {
+		return nil
+	}
+	return m.rootByLen[tokenCount]
+}
+
+func (m *Matcher) setMutableRootNode(tokenCount int, node *drainNode) {
+	if tokenCount < 0 {
+		return
+	}
+	if tokenCount >= len(m.rootByLen) {
+		m.rootByLen = append(m.rootByLen, make([]*drainNode, tokenCount-len(m.rootByLen)+1)...)
+	}
+	m.rootByLen[tokenCount] = node
+}
+
+func (m *Matcher) flatRootNode(tokenCount int) uint32 {
+	if tokenCount < 0 || tokenCount >= len(m.flatTree.rootByLen) {
+		return 0
+	}
+	return m.flatTree.rootByLen[tokenCount]
+}
+
+func (m *Matcher) rebuildFlatTree() {
+	m.flatTree.rootByLen = make([]uint32, len(m.rootByLen))
+	m.flatTree.nodes = make([]drainFlatNode, 1) // index 0 means "missing node"
+	if len(m.rootByLen) == 0 {
+		return
+	}
+
+	seen := make(map[*drainNode]uint32, len(m.rootByLen))
+	for tokenCount, root := range m.rootByLen {
+		if root == nil {
+			continue
+		}
+		m.flatTree.rootByLen[tokenCount] = flattenDrainNode(root, &m.flatTree, seen)
+	}
+}
+
+func flattenDrainNode(node *drainNode, tree *drainFlatTree, seen map[*drainNode]uint32) uint32 {
+	if idx, ok := seen[node]; ok {
+		return idx
+	}
+
+	idx := uint32(len(tree.nodes))
+	seen[node] = idx
+	tree.nodes = append(tree.nodes, drainFlatNode{
+		clusterIDs: append([]int(nil), node.clusterIDs...),
+	})
+
+	if len(node.children) == 0 {
+		return idx
+	}
+
+	keys := make([]uint64, 0, len(node.children))
+	for key := range node.children {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	children := make([]uint32, len(keys))
+	for i, key := range keys {
+		children[i] = flattenDrainNode(node.children[key], tree, seen)
+	}
+
+	flat := &tree.nodes[idx]
+	flat.childKeys = keys
+	flat.childIndexes = children
+	return idx
+}
+
+func flatNodeChild(node *drainFlatNode, tokenID uint64) uint32 {
+	if len(node.childKeys) <= 8 {
+		for i, key := range node.childKeys {
+			if key == tokenID {
+				return node.childIndexes[i]
+			}
+		}
+		return 0
+	}
+
+	lo, hi := 0, len(node.childKeys)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		key := node.childKeys[mid]
+		if key == tokenID {
+			return node.childIndexes[mid]
+		}
+		if key < tokenID {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return 0
+}
+
+func (m *Matcher) rebuildMatchNeeded() {
+	m.matchNeeded = make([]int, len(m.rootByLen))
+	for tokenCount := range len(m.matchNeeded) {
+		m.matchNeeded[tokenCount] = int(math.Ceil(m.cfg.MatchThreshold * float64(tokenCount)))
+	}
+}
+
+func (m *Matcher) requiredScore(tokenCount int, simTh float64) int {
+	if simTh == m.cfg.MatchThreshold && tokenCount >= 0 && tokenCount < len(m.matchNeeded) {
+		return m.matchNeeded[tokenCount]
+	}
+	return int(math.Ceil(simTh * float64(tokenCount)))
+}
+
+func (m *Matcher) rebuildMatchPrefilter() {
+	if !m.cfg.EnableMatchPrefilter {
+		m.prefilter = matchPrefilter{}
+		return
+	}
+
+	pf := matchPrefilter{
+		anyByLen:       make(map[int][]int),
+		firstByEdge:    make(map[prefilterEdgeKey][]int),
+		lastByEdge:     make(map[prefilterEdgeKey][]int),
+		firstLastByKey: make(map[prefilterFirstLastKey][]int),
+	}
+
+	for id := 1; id < len(m.clusters); id++ {
+		cluster := m.clusters[id]
+		if cluster == nil {
+			continue
+		}
+
+		tokenCount := len(cluster.tokenIDs)
+		if tokenCount == 0 {
+			pf.anyByLen[0] = append(pf.anyByLen[0], id)
+			continue
+		}
+
+		firstID := cluster.tokenIDs[0]
+		lastID := cluster.tokenIDs[tokenCount-1]
+		firstIsParam := firstID == m.paramID
+		lastIsParam := lastID == m.paramID
+
+		switch {
+		case firstIsParam && lastIsParam:
+			pf.anyByLen[tokenCount] = append(pf.anyByLen[tokenCount], id)
+		case !firstIsParam && lastIsParam:
+			key := prefilterEdgeKey{tokenCount: tokenCount, tokenID: firstID}
+			pf.firstByEdge[key] = append(pf.firstByEdge[key], id)
+		case firstIsParam && !lastIsParam:
+			key := prefilterEdgeKey{tokenCount: tokenCount, tokenID: lastID}
+			pf.lastByEdge[key] = append(pf.lastByEdge[key], id)
+		default:
+			key := prefilterFirstLastKey{tokenCount: tokenCount, firstID: firstID, lastID: lastID}
+			pf.firstLastByKey[key] = append(pf.firstLastByKey[key], id)
+		}
+	}
+
+	m.prefilter = pf
+}
+
+func (m *Matcher) prefilterCandidatesInto(tokens []string, dst []int) ([]int, bool) {
+	tokenCount := len(tokens)
+	any := m.prefilter.anyByLen[tokenCount]
+
+	var first []int
+	var last []int
+	var firstLast []int
+	if tokenCount > 0 {
+		firstID, firstKnown := m.dict.lookup(tokens[0])
+		lastID, lastKnown := m.dict.lookup(tokens[tokenCount-1])
+		if firstKnown {
+			first = m.prefilter.firstByEdge[prefilterEdgeKey{
+				tokenCount: tokenCount,
+				tokenID:    firstID,
+			}]
+		}
+		if lastKnown {
+			last = m.prefilter.lastByEdge[prefilterEdgeKey{
+				tokenCount: tokenCount,
+				tokenID:    lastID,
+			}]
+		}
+		if firstKnown && lastKnown {
+			firstLast = m.prefilter.firstLastByKey[prefilterFirstLastKey{
+				tokenCount: tokenCount,
+				firstID:    firstID,
+				lastID:     lastID,
+			}]
+		}
+	}
+
+	nonEmpty := 0
+	var single []int
+	total := 0
+	for _, group := range [...][]int{any, first, last, firstLast} {
+		if len(group) == 0 {
+			continue
+		}
+		nonEmpty++
+		single = group
+		total += len(group)
+	}
+	if nonEmpty == 0 {
+		return nil, false
+	}
+	if nonEmpty == 1 {
+		return single, true
+	}
+
+	out := dst[:0]
+	if cap(out) < total {
+		out = make([]int, 0, total)
+	}
+	out = append(out, any...)
+	out = append(out, first...)
+	out = append(out, last...)
+	out = append(out, firstLast...)
+	return out, true
+}
+
+func (m *Matcher) validateClusterReferences() error {
+	seen := make(map[*drainNode]struct{})
+	stack := make([]*drainNode, 0, len(m.rootByLen))
+	for _, root := range m.rootByLen {
+		if root != nil {
+			stack = append(stack, root)
+		}
+	}
+
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if _, ok := seen[node]; ok {
+			continue
+		}
+		seen[node] = struct{}{}
+
+		for _, clusterID := range node.clusterIDs {
+			if clusterID <= 0 || clusterID >= len(m.clusters) {
+				return fmt.Errorf("invalid cluster id %d in tree", clusterID)
+			}
+			if m.clusters[clusterID] == nil {
+				return fmt.Errorf("nil cluster at id %d in tree", clusterID)
+			}
+		}
+		for _, child := range node.children {
+			if child != nil {
+				stack = append(stack, child)
+			}
+		}
+	}
+
+	if !m.cfg.EnableMatchPrefilter {
+		return nil
+	}
+
+	for _, ids := range m.prefilter.anyByLen {
+		if err := m.validateClusterIDSlice(ids); err != nil {
+			return err
+		}
+	}
+	for _, ids := range m.prefilter.firstByEdge {
+		if err := m.validateClusterIDSlice(ids); err != nil {
+			return err
+		}
+	}
+	for _, ids := range m.prefilter.lastByEdge {
+		if err := m.validateClusterIDSlice(ids); err != nil {
+			return err
+		}
+	}
+	for _, ids := range m.prefilter.firstLastByKey {
+		if err := m.validateClusterIDSlice(ids); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Matcher) validateClusterIDSlice(clusterIDs []int) error {
+	for _, clusterID := range clusterIDs {
+		if clusterID <= 0 || clusterID >= len(m.clusters) {
+			return fmt.Errorf("invalid cluster id %d", clusterID)
+		}
+		if m.clusters[clusterID] == nil {
+			return fmt.Errorf("nil cluster at id %d", clusterID)
+		}
+	}
+	return nil
 }
