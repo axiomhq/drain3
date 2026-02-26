@@ -1,6 +1,11 @@
 package drain3
 
-import "fmt"
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
 
 // Config controls training and matching behavior.
 type Config struct {
@@ -114,4 +119,81 @@ func isZeroConfig(cfg Config) bool {
 		!cfg.ParametrizeNumericTokens &&
 		!cfg.EnableMatchPrefilter &&
 		len(cfg.ExtraDelimiters) == 0
+}
+
+func readConfigBinary(r *bytes.Reader, ver byte) (Config, error) {
+	var depth int32
+	if err := binary.Read(r, binary.LittleEndian, &depth); err != nil {
+		return Config{}, fmt.Errorf("read depth: %w", err)
+	}
+	var simTh float64
+	if err := binary.Read(r, binary.LittleEndian, &simTh); err != nil {
+		return Config{}, fmt.Errorf("read similarity threshold: %w", err)
+	}
+	var matchTh float64
+	if err := binary.Read(r, binary.LittleEndian, &matchTh); err != nil {
+		return Config{}, fmt.Errorf("read match threshold: %w", err)
+	}
+	var maxChildren int32
+	if err := binary.Read(r, binary.LittleEndian, &maxChildren); err != nil {
+		return Config{}, fmt.Errorf("read max children: %w", err)
+	}
+	var maxTokens, maxBytes, topK int32
+	if ver >= 2 {
+		if err := binary.Read(r, binary.LittleEndian, &maxTokens); err != nil {
+			return Config{}, fmt.Errorf("read max tokens: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &maxBytes); err != nil {
+			return Config{}, fmt.Errorf("read max bytes: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &topK); err != nil {
+			return Config{}, fmt.Errorf("read top k: %w", err)
+		}
+	}
+	param, err := readString(r)
+	if err != nil {
+		return Config{}, err
+	}
+	flag, err := r.ReadByte()
+	if err != nil {
+		return Config{}, fmt.Errorf("read numeric parameterization flag: %w", err)
+	}
+	prefilterFlag, err := r.ReadByte()
+	if err != nil {
+		return Config{}, fmt.Errorf("read prefilter enable flag: %w", err)
+	}
+	nDelims, err := readUvarint(r)
+	if err != nil {
+		return Config{}, fmt.Errorf("read delimiter count: %w", err)
+	}
+	if nDelims > uint64(^uint(0)>>1) {
+		return Config{}, errors.New("delimiter count overflows int")
+	}
+
+	var delims []string
+	if nDelims > 0 {
+		delims = make([]string, int(nDelims))
+		for i := range delims {
+			d, err := readString(r)
+			if err != nil {
+				return Config{}, err
+			}
+			delims[i] = d
+		}
+	}
+
+	cfg := Config{
+		Depth:                    int(depth),
+		SimilarityThreshold:      simTh,
+		MatchThreshold:           matchTh,
+		MaxChildren:              int(maxChildren),
+		MaxTokens:                int(maxTokens),
+		MaxBytes:                 int(maxBytes),
+		TopK:                     int(topK),
+		ParamString:              param,
+		ParametrizeNumericTokens: flag == 1,
+		EnableMatchPrefilter:     prefilterFlag == 1,
+		ExtraDelimiters:          delims,
+	}
+	return normalizeConfig(cfg)
 }

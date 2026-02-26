@@ -539,6 +539,21 @@ func tokenizeWhitespaceInto(content string, dst []string) []string {
 	if dst != nil {
 		dst = dst[:0]
 	}
+	// strings.IndexByte uses SIMD but pays per-call overhead (function call +
+	// string re-slice). For short strings (≤128 bytes) with frequent spaces
+	// the overhead dominates; a scalar byte loop is faster. For longer
+	// strings the SIMD scan between spaces amortises the cost.
+	if len(content) <= 128 {
+		start := 0
+		for i := 0; i < len(content); i++ {
+			if content[i] == ' ' {
+				dst = append(dst, content[start:i])
+				start = i + 1
+			}
+		}
+		dst = append(dst, content[start:])
+		return dst
+	}
 	for {
 		i := strings.IndexByte(content, ' ')
 		if i < 0 {
@@ -560,8 +575,12 @@ func extractArgsByIDInto(templateTokenIDs []uint64, lineTokens []string, paramID
 		return nil
 	}
 	limit := len(templateTokenIDs)
-	limit = min(limit, len(lineTokens))
-	limit = min(limit, paramCount)
+	if len(lineTokens) < limit {
+		limit = len(lineTokens)
+	}
+	if paramCount > limit {
+		paramCount = limit
+	}
 	args := dst[:0]
 	if cap(args) < paramCount {
 		args = make([]string, 0, paramCount)
@@ -655,83 +674,6 @@ func writeConfigBinary(w *bytes.Buffer, cfg Config) error {
 		}
 	}
 	return nil
-}
-
-func readConfigBinary(r *bytes.Reader, ver byte) (Config, error) {
-	var depth int32
-	if err := binary.Read(r, binary.LittleEndian, &depth); err != nil {
-		return Config{}, fmt.Errorf("read depth: %w", err)
-	}
-	var simTh float64
-	if err := binary.Read(r, binary.LittleEndian, &simTh); err != nil {
-		return Config{}, fmt.Errorf("read similarity threshold: %w", err)
-	}
-	var matchTh float64
-	if err := binary.Read(r, binary.LittleEndian, &matchTh); err != nil {
-		return Config{}, fmt.Errorf("read match threshold: %w", err)
-	}
-	var maxChildren int32
-	if err := binary.Read(r, binary.LittleEndian, &maxChildren); err != nil {
-		return Config{}, fmt.Errorf("read max children: %w", err)
-	}
-	var maxTokens, maxBytes, topK int32
-	if ver >= 2 {
-		if err := binary.Read(r, binary.LittleEndian, &maxTokens); err != nil {
-			return Config{}, fmt.Errorf("read max tokens: %w", err)
-		}
-		if err := binary.Read(r, binary.LittleEndian, &maxBytes); err != nil {
-			return Config{}, fmt.Errorf("read max bytes: %w", err)
-		}
-		if err := binary.Read(r, binary.LittleEndian, &topK); err != nil {
-			return Config{}, fmt.Errorf("read top k: %w", err)
-		}
-	}
-	param, err := readString(r)
-	if err != nil {
-		return Config{}, err
-	}
-	flag, err := r.ReadByte()
-	if err != nil {
-		return Config{}, fmt.Errorf("read numeric parameterization flag: %w", err)
-	}
-	prefilterFlag, err := r.ReadByte()
-	if err != nil {
-		return Config{}, fmt.Errorf("read prefilter enable flag: %w", err)
-	}
-	nDelims, err := readUvarint(r)
-	if err != nil {
-		return Config{}, fmt.Errorf("read delimiter count: %w", err)
-	}
-	if nDelims > uint64(^uint(0)>>1) {
-		return Config{}, errors.New("delimiter count overflows int")
-	}
-
-	var delims []string
-	if nDelims > 0 {
-		delims = make([]string, int(nDelims))
-		for i := range delims {
-			d, err := readString(r)
-			if err != nil {
-				return Config{}, err
-			}
-			delims[i] = d
-		}
-	}
-
-	cfg := Config{
-		Depth:                    int(depth),
-		SimilarityThreshold:      simTh,
-		MatchThreshold:           matchTh,
-		MaxChildren:              int(maxChildren),
-		MaxTokens:                int(maxTokens),
-		MaxBytes:                 int(maxBytes),
-		TopK:                     int(topK),
-		ParamString:              param,
-		ParametrizeNumericTokens: flag == 1,
-		EnableMatchPrefilter:     prefilterFlag == 1,
-		ExtraDelimiters:          delims,
-	}
-	return normalizeConfig(cfg)
 }
 
 func writeString(w *bytes.Buffer, s string) error {
