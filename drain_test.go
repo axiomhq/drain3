@@ -80,11 +80,11 @@ func TestMarshalRoundTrip(t *testing.T) {
 		t.Fatalf("train failed: %v", err)
 	}
 
-	payload, err := m.MarshalBinary()
+	payload, err := marshalBinary(m)
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)
 	}
-	loaded, err := LoadMatcher(payload)
+	loaded, err := loadMatcher(payload)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
@@ -111,18 +111,18 @@ func TestUnmarshalCorruptPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("train failed: %v", err)
 	}
-	payload, err := m.MarshalBinary()
+	payload, err := marshalBinary(m)
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)
 	}
 
-	if _, err := LoadMatcher(payload[:3]); err == nil {
+	if _, err := loadMatcher(payload[:3]); err == nil {
 		t.Fatalf("expected error for truncated payload")
 	}
 
 	bad := append([]byte(nil), payload...)
 	bad[0] = 'X'
-	if _, err := LoadMatcher(bad); err == nil {
+	if _, err := loadMatcher(bad); err == nil {
 		t.Fatalf("expected error for invalid magic")
 	}
 }
@@ -682,7 +682,7 @@ func BenchmarkCompression(b *testing.B) {
 				compressedBytes += len(s)
 			}
 			// Add serialized matcher size.
-			payload, _ := matcher.MarshalBinary()
+			payload, _ := marshalBinary(matcher)
 			compressedBytes += len(payload)
 
 			b.ReportMetric(float64(rawBytes)/(1<<20), "raw_MB/op")
@@ -760,9 +760,8 @@ func TestTopKCompression(t *testing.T) {
 		t.Fatalf("train: %v", err)
 	}
 
-	// Sort templates by count descending.
+	// Templates() returns sorted by count descending.
 	templates := full.Templates()
-	sort.Slice(templates, func(i, j int) bool { return templates[i].Count > templates[j].Count })
 
 	for _, topK := range []int{250} {
 		topK := topK
@@ -773,7 +772,7 @@ func TestTopKCompression(t *testing.T) {
 			}
 
 			// Rebuild matcher from pruned templates.
-			m, err := rebuildMatcherFromTemplates(full.Config(), keep)
+			m, err := NewMatcherFromTemplates(full.Config(), keep)
 			if err != nil {
 				t.Fatalf("rebuild: %v", err)
 			}
@@ -816,7 +815,7 @@ func TestTopKCompression(t *testing.T) {
 			compressedBytes += (totalRows + 63) / 64 * 8
 
 			// Matcher payload.
-			payload, _ := m.MarshalBinary()
+			payload, _ := marshalBinary(m)
 			compressedBytes += len(payload)
 
 			_ = paramString
@@ -907,7 +906,7 @@ func TestFullSweep(t *testing.T) {
 						keep = keep[:topK]
 					}
 
-					m, err := rebuildMatcherFromTemplates(full.Config(), keep)
+					m, err := NewMatcherFromTemplates(full.Config(), keep)
 					if err != nil {
 						t.Fatalf("rebuild: %v", err)
 					}
@@ -951,7 +950,7 @@ func TestFullSweep(t *testing.T) {
 						}
 					}
 					compressedBytes += (totalRows + 63) / 64 * 8
-					payload, _ := m.MarshalBinary()
+					payload, _ := marshalBinary(m)
 					compressedBytes += len(payload)
 
 					saved := rawBytes - compressedBytes
@@ -1039,7 +1038,7 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 				keep = keep[:topK]
 			}
 
-			m, err := rebuildMatcherFromTemplates(full.Config(), keep)
+			m, err := NewMatcherFromTemplates(full.Config(), keep)
 			if err != nil {
 				t.Fatalf("rebuild: %v", err)
 			}
@@ -1074,7 +1073,7 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 				}
 			}
 			compressedBytes += (totalRows + 63) / 64 * 8
-			payload, _ := m.MarshalBinary()
+			payload, _ := marshalBinary(m)
 			compressedBytes += len(payload)
 
 			saved := rawBytes - compressedBytes
