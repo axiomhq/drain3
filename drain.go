@@ -3,78 +3,100 @@ package drain3
 import (
 	"slices"
 	"strings"
+
+	"github.com/bits-and-blooms/bitset"
 )
 
 // Template is a trained log template.
 type Template struct {
-	ID     int
-	Tokens []string
-	Count  int
+	ID         int
+	Tokens     []string       // dense: only non-param tokens, in order
+	Params     *bitset.BitSet // bit i set = position i is a param placeholder
+	TokenCount int            // total number of positions (len(Tokens) + Params.Count())
+	Count      int            // number of matching log lines
 }
 
 // Matcher matches logs to trained Drain templates.
+//
+// Tokenization splits on individual space characters, not whitespace runs.
+// Consecutive spaces produce empty tokens, so "a  b" (two spaces) and "a b"
+// (one space) have different token counts and will never match each other.
+// This preserves the exact whitespace layout for lossless reconstruction.
 type Matcher struct {
 	// Serialized state (persisted by MarshalBinary / restored by UnmarshalBinary).
 	cfg       Config
 	templates []Template
 
 	// Rebuilt indexes — derived from cfg + templates by rebuildFromTemplates.
-	rootByLen        []*Node           // mutable prefix tree used during training
-	flatRootByLen    []uint32          // read-only flat tree: root node index per token count
-	flatNodes        []FlatNode        // read-only flat tree: all flattened nodes
-	prefilterBuckets []prefilterBucket // per-token-count candidate index
-	clusters         []*cluser         // cluster ID → cluster, 0 is sentinel
-	dictIDs          map[string]uint64 // token string → numeric ID
-	dictNextID       uint64            // next token ID to assign
-	paramID          uint64            // numeric ID of cfg.ParamString
-	nextCluster      int               // next cluster ID to assign
-	matchNeeded      []int             // pre-computed required-score per token count
+	rootByLen []*node    // prefix tree keyed by token count
+	clusters  []*cluster // cluster ID → cluster, 0 is sentinel
+	dictIDs     map[string]uint64 // token string → numeric ID
+	dictNextID  uint64            // next token ID to assign
+	paramID     uint64            // numeric ID of cfg.ParamString
+	nextCluster int               // next cluster ID to assign
 
-	// Scratch buffers — reused across training calls to reduce allocations.
+	// Scratch buffers — reused across addLogMessage calls during training.
 	scratchIDs []uint64
 	scratchTok []string
 }
 
-type Node struct {
-	children   map[uint64]*Node
+type node struct {
+	children   map[uint64]*node
 	clusterIDs []int
 }
 
-type FlatNode struct {
-	childKeys    []uint64
-	childIndexes []uint32
-	clusterIDs   []int
+type cluster struct {
+	id         int
+	size       int
+	paramCount int
+	tokenIDs   []uint64
+	tokenStr   []string
 }
 
-type prefilterBucket struct {
-	any []int // clusters with both first and last as param
+func newCluster(id int, tokenStr []string, tokenIDs []uint64, size int, paramID uint64) *cluster {
+	c := &cluster{id: id, size: size, tokenStr: tokenStr, tokenIDs: tokenIDs}
+	for _, tid := range tokenIDs {
+		if tid == paramID {
+			c.paramCount++
+		}
+	}
+	return c
+}
 
-	// Sorted arrays for binary-searched edge lookups.
-	firstKeys []uint64
-	firstVals [][]int
-	lastKeys  []uint64
-	lastVals  [][]int
-
-	// Sorted array of (firstID<<32 | lastID) for combined lookup.
-	flKeys []uint64
-	flVals [][]int
+func (c *cluster) extractArgsInto(lineTokens []string, paramID uint64, dst []string) []string {
+	if len(c.tokenIDs) == 0 || len(lineTokens) == 0 || c.paramCount == 0 {
+		return nil
+	}
+	limit := min(len(c.tokenIDs), len(lineTokens))
+	args := dst[:0]
+	if cap(args) < min(c.paramCount, limit) {
+		args = make([]string, 0, c.paramCount)
+	}
+	for i := 0; i < limit; i++ {
+		if c.tokenIDs[i] == paramID {
+			args = append(args, lineTokens[i])
+		}
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	return args
 }
 
 func newMatcher(cfg Config) *Matcher {
 	m := &Matcher{
 		cfg:         cfg,
-		clusters:    make([]*cluser, 1),
+		clusters:    make([]*cluster, 1),
 		nextCluster: 1,
 		dictIDs:     make(map[string]uint64),
 		dictNextID:  1,
 	}
 	m.paramID = m.internToken(cfg.ParamString)
-	m.rebuildMatchNeeded()
 	return m
 }
 
-func newNode() *Node {
-	return &Node{children: make(map[uint64]*Node)}
+func newNode() *node {
+	return &node{children: make(map[uint64]*node)}
 }
 
 // Config returns matcher configuration.
@@ -134,6 +156,9 @@ func tokenize(content string, extraDelimiters []string) []string {
 	return strings.Fields(content)
 }
 
+// tokenizeWhitespaceInto splits content on each individual space character.
+// Unlike strings.Fields, consecutive spaces produce empty-string tokens,
+// preserving the original whitespace layout for exact reconstruction.
 func tokenizeWhitespaceInto(content string, dst []string) []string {
 	if content == "" {
 		return nil
@@ -169,8 +194,8 @@ func tokenizeWhitespaceInto(content string, dst []string) []string {
 }
 
 func hasNumbers(s string) bool {
-	for _, ch := range s {
-		if ch >= '0' && ch <= '9' {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
 			return true
 		}
 	}
@@ -184,9 +209,11 @@ func deepCopyTemplates(in []Template) []Template {
 	out := make([]Template, len(in))
 	for i := range in {
 		out[i] = Template{
-			ID:     in[i].ID,
-			Tokens: slices.Clone(in[i].Tokens),
-			Count:  in[i].Count,
+			ID:         in[i].ID,
+			Tokens:     slices.Clone(in[i].Tokens),
+			Params:     in[i].Params.Clone(),
+			TokenCount: in[i].TokenCount,
+			Count:      in[i].Count,
 		}
 	}
 	return out

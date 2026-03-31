@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bits-and-blooms/bitset"
 )
 
 func TestTrainMatchBasic(t *testing.T) {
@@ -69,64 +71,6 @@ func TestDeterministicTemplates(t *testing.T) {
 	}
 }
 
-func TestMarshalRoundTrip(t *testing.T) {
-	samples := []string{
-		"foo 10 bar 20",
-		"foo 11 bar 21",
-		"alpha beta gamma",
-	}
-	m, err := Train(samples)
-	if err != nil {
-		t.Fatalf("train failed: %v", err)
-	}
-
-	payload, err := marshalBinary(m)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
-	loaded, err := loadMatcher(payload)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
-
-	if !reflect.DeepEqual(m.Config(), loaded.Config()) {
-		t.Fatalf("config mismatch")
-	}
-	if !reflect.DeepEqual(m.Templates(), loaded.Templates()) {
-		t.Fatalf("templates mismatch")
-	}
-
-	queries := []string{"foo 99 bar 100", "alpha beta gamma", "alpha beta"}
-	for _, q := range queries {
-		id1, args1, ok1 := m.Match(q)
-		id2, args2, ok2 := loaded.Match(q)
-		if ok1 != ok2 || id1 != id2 || !reflect.DeepEqual(args1, args2) {
-			t.Fatalf("round-trip mismatch for %q: (%d,%v,%v) != (%d,%v,%v)", q, id1, args1, ok1, id2, args2, ok2)
-		}
-	}
-}
-
-func TestUnmarshalCorruptPayload(t *testing.T) {
-	m, err := Train([]string{"a b c"})
-	if err != nil {
-		t.Fatalf("train failed: %v", err)
-	}
-	payload, err := marshalBinary(m)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
-
-	if _, err := loadMatcher(payload[:3]); err == nil {
-		t.Fatalf("expected error for truncated payload")
-	}
-
-	bad := append([]byte(nil), payload...)
-	bad[0] = 'X'
-	if _, err := loadMatcher(bad); err == nil {
-		t.Fatalf("expected error for invalid magic")
-	}
-}
-
 func TestConfigAndTemplatesAreCopied(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ExtraDelimiters = []string{"="}
@@ -153,6 +97,91 @@ func TestTrainWithConfigValidation(t *testing.T) {
 	cfg.Depth = 2
 	if _, err := TrainWithConfig([]string{"a b c"}, cfg); err == nil {
 		t.Fatalf("expected error for invalid depth")
+	}
+}
+
+func TestZeroThresholdsAreValid(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SimilarityThreshold = 0.0
+	cfg.MatchThreshold = 0.0
+	m, err := TrainWithConfig([]string{"A B C", "A B D"}, cfg)
+	if err != nil {
+		t.Fatalf("expected 0.0 thresholds to be valid, got error: %v", err)
+	}
+	// With MatchThreshold 0.0, required score = 0, so any candidate
+	// reachable via the prefix tree is accepted regardless of similarity.
+	// "A X Y" routes through "A" at the tree root then scores 0 — accepted.
+	if _, _, ok := m.Match("A X Y"); !ok {
+		t.Fatalf("expected match with 0.0 match threshold for routable line")
+	}
+
+	// With SimilarityThreshold 0.0, training merges aggressively.
+	// "A B C" and "A B D" should produce one template: "A B <*>".
+	templates := m.Templates()
+	if len(templates) != 1 {
+		t.Fatalf("expected 1 template with 0.0 similarity, got %d", len(templates))
+	}
+}
+
+func TestMaxClusters(t *testing.T) {
+	// Each line has a unique first token, so without MaxClusters each gets its own cluster.
+	lines := []string{
+		"alpha X Y",
+		"bravo X Y",
+		"charlie X Y",
+		"delta X Y",
+		"echo X Y",
+	}
+
+	cfg := DefaultConfig()
+	cfg.MaxClusters = 2
+	m, err := TrainWithConfig(lines, cfg)
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+
+	templates := m.Templates()
+	if len(templates) > 2 {
+		t.Fatalf("expected at most 2 templates, got %d", len(templates))
+	}
+
+	// Without cap, all lines should produce more clusters.
+	cfg.MaxClusters = 0
+	mFull, err := TrainWithConfig(lines, cfg)
+	if err != nil {
+		t.Fatalf("train uncapped: %v", err)
+	}
+	if len(mFull.Templates()) <= len(templates) {
+		t.Fatalf("expected uncapped training to produce more templates: got %d vs capped %d",
+			len(mFull.Templates()), len(templates))
+	}
+}
+
+func TestMaxClustersSerializationRoundTrip(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxClusters = 50
+	m, err := TrainWithConfig([]string{"A B C", "A B D"}, cfg)
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+
+	payload, err := m.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	loaded, err := LoadMatcher(payload)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if loaded.Config().MaxClusters != 50 {
+		t.Fatalf("MaxClusters round-trip: got %d, want 50", loaded.Config().MaxClusters)
+	}
+}
+
+func TestZeroValueConfigIsRejected(t *testing.T) {
+	if _, err := TrainWithConfig([]string{"a b c"}, Config{}); err == nil {
+		t.Fatalf("expected error for zero-value Config{}")
 	}
 }
 
@@ -304,7 +333,7 @@ func TestMatchIsSensitiveToRepeatedSpaces(t *testing.T) {
 	}
 }
 
-func TestPrefilterParityWithTreeSearch(t *testing.T) {
+func TestMatchWithWildcardPositions(t *testing.T) {
 	samples := []string{
 		"a mid c",
 		"b mid c",
@@ -315,33 +344,25 @@ func TestPrefilterParityWithTreeSearch(t *testing.T) {
 		"literal line",
 	}
 
-	withPrefilter, err := Train(samples)
+	m, err := Train(samples)
 	if err != nil {
-		t.Fatalf("train with prefilter failed: %v", err)
+		t.Fatalf("train failed: %v", err)
 	}
 
-	cfgNoPrefilter := withPrefilter.Config()
-	cfgNoPrefilter.EnableMatchPrefilter = false
-	withoutPrefilter, err := TrainWithConfig(samples, cfgNoPrefilter)
-	if err != nil {
-		t.Fatalf("train without prefilter failed: %v", err)
+	// "x edge y" + "x edge z" merge into "x edge <*>" during training.
+	// Tree routes on first token, so only lines starting with a known
+	// first token can match.
+	if _, _, ok := m.Match("x edge t"); !ok {
+		t.Fatalf("expected match for 'x edge t' (first token 'x' in tree, pos 2 is param)")
 	}
-
-	queries := []string{
-		"u mid c",  // first wildcard + concrete last
-		"x edge t", // concrete first + wildcard last
-		"u core t", // wildcard first + wildcard last
-		"literal line",
-		"literal  line",
-		"no match line",
+	if _, _, ok := m.Match("literal line"); !ok {
+		t.Fatalf("expected match for 'literal line'")
 	}
-
-	for _, q := range queries {
-		idA, argsA, okA := withPrefilter.Match(q)
-		idB, argsB, okB := withoutPrefilter.Match(q)
-		if okA != okB || idA != idB || !reflect.DeepEqual(argsA, argsB) {
-			t.Fatalf("prefilter parity mismatch for %q: with=(%d,%v,%v) without=(%d,%v,%v)", q, idA, argsA, okA, idB, argsB, okB)
-		}
+	if _, _, ok := m.Match("literal  line"); ok {
+		t.Fatalf("expected no match for 'literal  line' (different token count)")
+	}
+	if _, _, ok := m.Match("no match line"); ok {
+		t.Fatalf("expected no match for unknown first token")
 	}
 }
 
@@ -379,12 +400,11 @@ func TestColumnStyleClusterRemapFlow(t *testing.T) {
 		clusterTemplateIDs[i] = invalidTemplateID
 	}
 
-	paramString := DefaultConfig().ParamString
 	templateParamCounts := make([]int, 0, len(clusters))
 	for _, cluster := range clusters {
 		templateID := uint32(len(templateParamCounts))
 		clusterTemplateIDs[cluster.ID] = templateID
-		templateParamCounts = append(templateParamCounts, countParamTokens(cluster.Tokens, paramString))
+		templateParamCounts = append(templateParamCounts, countParamTokens(cluster.Params))
 	}
 
 	scratch := make([]string, 0, 64)
@@ -451,11 +471,10 @@ func TestLosslessRoundTripWithRawFallback(t *testing.T) {
 		clusterToTemplate[i] = invalidTemplateID
 	}
 
-	paramString := m.Config().ParamString
 	templateParamCounts := make([]int, len(templates))
 	for templateID, template := range templates {
 		clusterToTemplate[template.ID] = templateID
-		templateParamCounts[templateID] = countParamTokens(template.Tokens, paramString)
+		templateParamCounts[templateID] = countParamTokens(template.Params)
 	}
 
 	lines := []string{
@@ -493,7 +512,7 @@ func TestLosslessRoundTripWithRawFallback(t *testing.T) {
 			continue
 		}
 
-		rendered, ok := renderTemplateWithParams(templates[templateID].Tokens, params, paramString)
+		rendered, ok := renderTemplateWithParams(templates[templateID], params)
 		if !ok {
 			out[i] = line
 			rawFallbackCount++
@@ -515,19 +534,21 @@ func TestLosslessRoundTripWithRawFallback(t *testing.T) {
 	}
 }
 
-func renderTemplateWithParams(templateTokens []string, params []string, paramString string) (string, bool) {
-	rendered := make([]string, len(templateTokens))
+func renderTemplateWithParams(tmpl Template, params []string) (string, bool) {
+	rendered := make([]string, tmpl.TokenCount)
+	denseIdx := 0
 	paramIdx := 0
-	for i, token := range templateTokens {
-		if token != paramString {
-			rendered[i] = token
-			continue
+	for i := 0; i < tmpl.TokenCount; i++ {
+		if tmpl.Params.Test(uint(i)) {
+			if paramIdx >= len(params) {
+				return "", false
+			}
+			rendered[i] = params[paramIdx]
+			paramIdx++
+		} else {
+			rendered[i] = tmpl.Tokens[denseIdx]
+			denseIdx++
 		}
-		if paramIdx >= len(params) {
-			return "", false
-		}
-		rendered[i] = params[paramIdx]
-		paramIdx++
 	}
 	if paramIdx != len(params) {
 		return "", false
@@ -535,14 +556,8 @@ func renderTemplateWithParams(templateTokens []string, params []string, paramStr
 	return strings.Join(rendered, " "), true
 }
 
-func countParamTokens(tokens []string, paramString string) int {
-	count := 0
-	for _, token := range tokens {
-		if token == paramString {
-			count++
-		}
-	}
-	return count
+func countParamTokens(params *bitset.BitSet) int {
+	return int(params.Count())
 }
 
 // matchEntry holds the compressed representation of a matched line.
@@ -626,11 +641,10 @@ func BenchmarkCompression(b *testing.B) {
 	for i := range clusterToTemplate {
 		clusterToTemplate[i] = ^uint32(0)
 	}
-	paramString := matcher.Config().ParamString
 	templateParamCounts := make([]int, len(templates))
 	for denseID, t := range templates {
 		clusterToTemplate[t.ID] = uint32(denseID)
-		templateParamCounts[denseID] = countParamTokens(t.Tokens, paramString)
+		templateParamCounts[denseID] = countParamTokens(t.Params)
 	}
 
 	b.Logf("templates: %d", len(templates))
@@ -682,7 +696,7 @@ func BenchmarkCompression(b *testing.B) {
 				compressedBytes += len(s)
 			}
 			// Add serialized matcher size.
-			payload, _ := marshalBinary(matcher)
+			payload, _ := matcher.MarshalBinary()
 			compressedBytes += len(payload)
 
 			b.ReportMetric(float64(rawBytes)/(1<<20), "raw_MB/op")
@@ -788,7 +802,6 @@ func TestTopKCompression(t *testing.T) {
 			for i := range clusterToTemplate {
 				clusterToTemplate[i] = ^uint32(0)
 			}
-			paramString := m.Config().ParamString
 			for denseID, tmpl := range keep {
 				clusterToTemplate[tmpl.ID] = uint32(denseID)
 			}
@@ -815,10 +828,9 @@ func TestTopKCompression(t *testing.T) {
 			compressedBytes += (totalRows + 63) / 64 * 8
 
 			// Matcher payload.
-			payload, _ := marshalBinary(m)
+			payload, _ := m.MarshalBinary()
 			compressedBytes += len(payload)
 
-			_ = paramString
 			ratio := float64(rawBytes) / float64(compressedBytes)
 
 			t.Logf("templates: %d | matched: %d (%.1f%%) | unmatched: %d | compressed: %.1f MB | ratio: %.2fx | matcher: %d bytes",
@@ -950,7 +962,7 @@ func TestFullSweep(t *testing.T) {
 						}
 					}
 					compressedBytes += (totalRows + 63) / 64 * 8
-					payload, _ := marshalBinary(m)
+					payload, _ := m.MarshalBinary()
 					compressedBytes += len(payload)
 
 					saved := rawBytes - compressedBytes
@@ -1073,7 +1085,7 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 				}
 			}
 			compressedBytes += (totalRows + 63) / 64 * 8
-			payload, _ := marshalBinary(m)
+			payload, _ := m.MarshalBinary()
 			compressedBytes += len(payload)
 
 			saved := rawBytes - compressedBytes

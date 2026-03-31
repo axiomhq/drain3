@@ -10,9 +10,9 @@ type Config struct {
 	MaxChildren              int
 	MaxTokens                int
 	MaxBytes                 int
+	MaxClusters              int // 0 means unlimited
 	ParamString              string
 	ParametrizeNumericTokens bool
-	EnableMatchPrefilter     bool
 	ExtraDelimiters          []string
 }
 
@@ -27,55 +27,30 @@ func DefaultConfig() Config {
 		MaxBytes:                 1024,
 		ParamString:              "<*>",
 		ParametrizeNumericTokens: true,
-		EnableMatchPrefilter:     true,
 	}
 }
 
 func normalizeConfig(cfg Config) (Config, error) {
-	if isZeroConfig(cfg) {
-		cfg = DefaultConfig()
-	}
-
-	def := DefaultConfig()
-	if cfg.Depth == 0 {
-		cfg.Depth = def.Depth
-	}
-	if cfg.SimilarityThreshold == 0 {
-		cfg.SimilarityThreshold = def.SimilarityThreshold
-	}
-	if cfg.MatchThreshold == 0 {
-		cfg.MatchThreshold = def.MatchThreshold
-	}
-	if cfg.MaxChildren == 0 {
-		cfg.MaxChildren = def.MaxChildren
-	}
-	if cfg.MaxTokens == 0 {
-		cfg.MaxTokens = def.MaxTokens
-	}
-	if cfg.MaxBytes == 0 {
-		cfg.MaxBytes = def.MaxBytes
-	}
-	if cfg.ParamString == "" {
-		cfg.ParamString = def.ParamString
-	}
-
 	if cfg.Depth < 3 {
-		return Config{}, fmt.Errorf("depth must be >= 3")
+		return Config{}, fmt.Errorf("depth must be >= 3, got %d", cfg.Depth)
 	}
 	if cfg.SimilarityThreshold < 0 || cfg.SimilarityThreshold > 1 {
-		return Config{}, fmt.Errorf("similarity threshold must be in [0, 1]")
+		return Config{}, fmt.Errorf("similarity threshold must be in [0, 1], got %f", cfg.SimilarityThreshold)
 	}
 	if cfg.MatchThreshold < 0 || cfg.MatchThreshold > 1 {
-		return Config{}, fmt.Errorf("match threshold must be in [0, 1]")
+		return Config{}, fmt.Errorf("match threshold must be in [0, 1], got %f", cfg.MatchThreshold)
 	}
 	if cfg.MaxChildren < 2 {
-		return Config{}, fmt.Errorf("max children must be >= 2")
+		return Config{}, fmt.Errorf("max children must be >= 2, got %d", cfg.MaxChildren)
 	}
 	if cfg.MaxTokens < 1 {
-		return Config{}, fmt.Errorf("max tokens must be >= 1")
+		return Config{}, fmt.Errorf("max tokens must be >= 1, got %d", cfg.MaxTokens)
 	}
 	if cfg.MaxBytes < 1 {
-		return Config{}, fmt.Errorf("max bytes must be >= 1")
+		return Config{}, fmt.Errorf("max bytes must be >= 1, got %d", cfg.MaxBytes)
+	}
+	if cfg.MaxClusters < 0 {
+		return Config{}, fmt.Errorf("max clusters must be >= 0, got %d", cfg.MaxClusters)
 	}
 	if cfg.ParamString == "" {
 		return Config{}, fmt.Errorf("param string must not be empty")
@@ -92,17 +67,4 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 
 	return cfg, nil
-}
-
-func isZeroConfig(cfg Config) bool {
-	return cfg.Depth == 0 &&
-		cfg.SimilarityThreshold == 0 &&
-		cfg.MatchThreshold == 0 &&
-		cfg.MaxChildren == 0 &&
-		cfg.MaxTokens == 0 &&
-		cfg.MaxBytes == 0 &&
-		cfg.ParamString == "" &&
-		!cfg.ParametrizeNumericTokens &&
-		!cfg.EnableMatchPrefilter &&
-		len(cfg.ExtraDelimiters) == 0
 }

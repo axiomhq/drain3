@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+
+	"github.com/bits-and-blooms/bitset"
 )
 
 // Train trains a matcher with default config.
@@ -23,12 +25,6 @@ func TrainWithConfig(samples []string, cfg Config) (*Matcher, error) {
 		m.addLogMessage(sample)
 	}
 	m.syncTemplatesFromClusters()
-	m.rebuildMatchPrefilter()
-	m.rebuildFlatTree()
-	m.rebuildMatchNeeded()
-	if err := m.validateClusterReferences(); err != nil {
-		return nil, err
-	}
 	return m, nil
 }
 
@@ -74,12 +70,22 @@ func (m *Matcher) rebuildFromTemplates(cfg Config, templates []Template) error {
 		}
 	}
 
-	next.clusters = make([]*cluser, maxID+1)
+	next.clusters = make([]*cluster, maxID+1)
 	next.nextCluster = maxID + 1
 
 	for _, t := range sorted {
-		ids := next.internTokenIDs(t.Tokens, nil)
-		cluster := newCluster(t.ID, slices.Clone(t.Tokens), ids, t.Count, next.paramID)
+		full := make([]string, t.TokenCount)
+		denseIdx := 0
+		for i := 0; i < t.TokenCount; i++ {
+			if t.Params.Test(uint(i)) {
+				full[i] = next.cfg.ParamString
+			} else {
+				full[i] = t.Tokens[denseIdx]
+				denseIdx++
+			}
+		}
+		ids := next.internTokenIDs(full, nil)
+		cluster := newCluster(t.ID, full, ids, t.Count, next.paramID)
 		next.clusters[t.ID] = cluster
 	}
 	for id := 1; id < len(next.clusters); id++ {
@@ -88,12 +94,6 @@ func (m *Matcher) rebuildFromTemplates(cfg Config, templates []Template) error {
 		}
 	}
 	next.syncTemplatesFromClusters()
-	next.rebuildMatchPrefilter()
-	next.rebuildFlatTree()
-	next.rebuildMatchNeeded()
-	if err := next.validateClusterReferences(); err != nil {
-		return err
-	}
 
 	*m = *next
 	return nil
@@ -106,10 +106,22 @@ func (m *Matcher) syncTemplatesFromClusters() {
 		if c == nil {
 			continue
 		}
+		tokenCount := len(c.tokenIDs)
+		params := bitset.New(uint(tokenCount))
+		dense := make([]string, 0, tokenCount-c.paramCount)
+		for i, tid := range c.tokenIDs {
+			if tid == m.paramID {
+				params.Set(uint(i))
+			} else {
+				dense = append(dense, c.tokenStr[i])
+			}
+		}
 		out = append(out, Template{
-			ID:     c.id,
-			Tokens: c.tokenStr,
-			Count:  c.size,
+			ID:         c.id,
+			Tokens:     dense,
+			Params:     params,
+			TokenCount: tokenCount,
+			Count:      c.size,
 		})
 	}
 	slices.SortFunc(out, func(a, b Template) int { return cmp.Compare(b.Count, a.Count) })
@@ -133,16 +145,19 @@ func (m *Matcher) addLogMessage(content string) {
 	m.scratchIDs = m.internTokenIDs(tokens, m.scratchIDs)
 	tokenIDs := m.scratchIDs
 
-	matchCluster := m.treeSearch(tokenIDs, m.cfg.SimilarityThreshold)
+	matchCluster := m.treeSearch(tokenIDs, m.cfg.SimilarityThreshold, false)
 	if matchCluster == nil {
+		if m.cfg.MaxClusters > 0 && m.nextCluster-1 >= m.cfg.MaxClusters {
+			return // cluster cap reached, drop line
+		}
 		clusterID := m.nextCluster
 		m.nextCluster++
-		cluster := newCluster(clusterID, slices.Clone(tokens), slices.Clone(tokenIDs), 1, m.paramID)
+		cl := newCluster(clusterID, slices.Clone(tokens), slices.Clone(tokenIDs), 1, m.paramID)
 		if clusterID >= len(m.clusters) {
-			m.clusters = append(m.clusters, make([]*cluser, clusterID-len(m.clusters)+1)...)
+			m.clusters = append(m.clusters, make([]*cluster, clusterID-len(m.clusters)+1)...)
 		}
-		m.clusters[clusterID] = cluster
-		m.addSeqToPrefixTree(cluster)
+		m.clusters[clusterID] = cl
+		m.addSeqToPrefixTree(cl)
 		return
 	}
 
@@ -159,61 +174,16 @@ func (m *Matcher) addLogMessage(content string) {
 	matchCluster.size++
 }
 
-func (m *Matcher) treeSearch(tokenIDs []uint64, simTh float64) *cluser {
-	tokenCount := len(tokenIDs)
-	if tokenCount >= len(m.rootByLen) {
-		return nil
-	}
-	curNode := m.rootByLen[tokenCount]
-	if curNode == nil {
-		return nil
-	}
-
-	if tokenCount == 0 {
-		if len(curNode.clusterIDs) == 0 {
-			return nil
-		}
-		return m.clusters[curNode.clusterIDs[0]]
-	}
-
-	maxDepth := m.cfg.Depth - 2
-	curDepth := 1
-	for i := 0; i < tokenCount; i++ {
-		if curDepth >= maxDepth {
-			break
-		}
-		if curDepth == tokenCount {
-			break
-		}
-
-		tokenID := tokenIDs[i]
-		nextNode := curNode.children[tokenID]
-		if nextNode == nil {
-			nextNode = curNode.children[m.paramID]
-		}
-		if nextNode == nil {
-			return nil
-		}
-
-		curNode = nextNode
-		curDepth++
-	}
-
-	return m.fastMatch(curNode.clusterIDs, tokenIDs, simTh, false)
-}
-
-func (m *Matcher) addSeqToPrefixTree(cluster *cluser) {
+func (m *Matcher) addSeqToPrefixTree(cluster *cluster) {
 	tokenCount := len(cluster.tokenIDs)
 	if tokenCount >= len(m.rootByLen) {
-		m.rootByLen = append(m.rootByLen, make([]*Node, tokenCount-len(m.rootByLen)+1)...)
+		m.rootByLen = append(m.rootByLen, make([]*node, tokenCount-len(m.rootByLen)+1)...)
 	}
-	firstLayerNode := m.rootByLen[tokenCount]
-	if firstLayerNode == nil {
-		firstLayerNode = newNode()
-		m.rootByLen[tokenCount] = firstLayerNode
+	if m.rootByLen[tokenCount] == nil {
+		m.rootByLen[tokenCount] = newNode()
 	}
 
-	curNode := firstLayerNode
+	curNode := m.rootByLen[tokenCount]
 	if tokenCount == 0 {
 		curNode.clusterIDs = []int{cluster.id}
 		return
@@ -226,102 +196,40 @@ func (m *Matcher) addSeqToPrefixTree(cluster *cluser) {
 			break
 		}
 
-		nextNode := curNode.children[tokenID]
-		if nextNode == nil {
-			if m.cfg.ParametrizeNumericTokens && hasNumbers(cluster.tokenStr[i]) {
-				nextNode = curNode.children[m.paramID]
-				if nextNode == nil {
-					nextNode = newNode()
-					curNode.children[m.paramID] = nextNode
-				}
+		var next *node
+		if n := curNode.children[tokenID]; n != nil {
+			// Exact child exists.
+			next = n
+		} else if m.cfg.ParametrizeNumericTokens && hasNumbers(cluster.tokenStr[i]) {
+			// Numeric token: always route to wildcard.
+			next = curNode.children[m.paramID]
+			if next == nil {
+				next = newNode()
+				curNode.children[m.paramID] = next
+			}
+		} else {
+			// Non-numeric token not yet in tree.
+			// Specific tokens get up to MaxChildren-1 slots; one slot is
+			// reserved for the wildcard/param catch-all.
+			wild := curNode.children[m.paramID]
+			specificCount := len(curNode.children)
+			if wild != nil {
+				specificCount-- // wildcard already occupies its reserved slot
+			}
+			if specificCount < m.cfg.MaxChildren-1 {
+				next = newNode()
+				curNode.children[tokenID] = next
 			} else {
-				wildcardNode := curNode.children[m.paramID]
-				if wildcardNode != nil {
-					if len(curNode.children) < m.cfg.MaxChildren {
-						nextNode = newNode()
-						curNode.children[tokenID] = nextNode
-					} else {
-						nextNode = wildcardNode
-					}
-				} else {
-					nextChildren := len(curNode.children) + 1
-					if nextChildren < m.cfg.MaxChildren {
-						nextNode = newNode()
-						curNode.children[tokenID] = nextNode
-					} else if nextChildren == m.cfg.MaxChildren {
-						nextNode = newNode()
-						curNode.children[m.paramID] = nextNode
-					} else {
-						nextNode = curNode.children[m.paramID]
-						if nextNode == nil {
-							nextNode = newNode()
-							curNode.children[m.paramID] = nextNode
-						}
-					}
+				if wild == nil {
+					wild = newNode()
+					curNode.children[m.paramID] = wild
 				}
+				next = wild
 			}
 		}
 
-		curNode = nextNode
+		curNode = next
 		curDepth++
 	}
 }
 
-func (m *Matcher) validateClusterReferences() error {
-	seen := make(map[*Node]struct{})
-	stack := make([]*Node, 0, len(m.rootByLen))
-	for _, root := range m.rootByLen {
-		if root != nil {
-			stack = append(stack, root)
-		}
-	}
-
-	for len(stack) > 0 {
-		node := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if _, ok := seen[node]; ok {
-			continue
-		}
-		seen[node] = struct{}{}
-
-		for _, clusterID := range node.clusterIDs {
-			if clusterID <= 0 || clusterID >= len(m.clusters) {
-				return fmt.Errorf("invalid cluster id %d in tree", clusterID)
-			}
-			if m.clusters[clusterID] == nil {
-				return fmt.Errorf("nil cluster at id %d in tree", clusterID)
-			}
-		}
-		for _, child := range node.children {
-			if child != nil {
-				stack = append(stack, child)
-			}
-		}
-	}
-
-	if !m.cfg.EnableMatchPrefilter {
-		return nil
-	}
-
-	for _, b := range m.prefilterBuckets {
-		for _, groups := range [...][][]int{
-			{b.any},
-			b.firstVals,
-			b.lastVals,
-			b.flVals,
-		} {
-			for _, ids := range groups {
-				for _, clusterID := range ids {
-					if clusterID <= 0 || clusterID >= len(m.clusters) {
-						return fmt.Errorf("invalid cluster id %d", clusterID)
-					}
-					if m.clusters[clusterID] == nil {
-						return fmt.Errorf("nil cluster at id %d", clusterID)
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
