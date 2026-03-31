@@ -1,7 +1,9 @@
 package drain3
 
 import (
+	"cmp"
 	"math"
+	"slices"
 	"strings"
 )
 
@@ -51,6 +53,15 @@ func (m *Matcher) findMatch(line string, tokenBuf []string) (cluster *cluster, t
 	// mismatch during both tree navigation and scoring).
 	var tokenIDBuf [128]uint64
 	tokenIDs := m.lookupTokenIDsPartial(tokens, tokenIDBuf[:0])
+
+	tokenCount := len(tokens)
+	if m.cfg.EnableMatchPrefilter && tokenCount < len(m.prefilterBuckets) {
+		var candidateBuf [64]int
+		if candidateIDs, ok := m.prefilterCandidatesCompact(tokens, tokenCount, candidateBuf[:0]); ok {
+			return m.fastMatch(candidateIDs, tokenIDs, m.cfg.MatchThreshold, true), tokens
+		}
+		return nil, tokens
+	}
 	return m.treeSearch(tokenIDs, m.cfg.MatchThreshold, true), tokens
 }
 
@@ -95,11 +106,10 @@ func (m *Matcher) treeSearch(tokenIDs []uint64, simTh float64, includeParams boo
 
 func (m *Matcher) fastMatch(clusterIDs []int, tokenIDs []uint64, simTh float64, includeParams bool) *cluster {
 	nTokens := len(tokenIDs)
-	requiredScore := requiredScore(nTokens, simTh)
+	needed := m.requiredScore(nTokens, simTh)
 	maxScore := -1
 	maxParamCount := -1
 	var maxCluster *cluster
-	paramID := m.paramID
 	clusters := m.clusters
 
 	for _, clusterID := range clusterIDs {
@@ -117,16 +127,14 @@ func (m *Matcher) fastMatch(clusterIDs []int, tokenIDs []uint64, simTh float64, 
 		if includeParams {
 			simTokens = paramCount
 		}
-		remaining := nTokens - paramCount
-		for i, id := range cIDs {
-			if id == paramID {
-				continue
-			}
-			if id == tokenIDs[i] {
+		npIdx := cluster.nonParamIdx
+		remaining := len(npIdx)
+		for _, idx := range npIdx {
+			if cIDs[idx] == tokenIDs[idx] {
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < requiredScore {
+			if simTokens+remaining < needed {
 				break
 			}
 		}
@@ -138,7 +146,7 @@ func (m *Matcher) fastMatch(clusterIDs []int, tokenIDs []uint64, simTh float64, 
 		}
 	}
 
-	if maxScore >= requiredScore {
+	if maxScore >= needed {
 		return maxCluster
 	}
 	return nil
@@ -161,7 +169,182 @@ func (m *Matcher) lookupTokenIDsPartial(tokens []string, dst []uint64) []uint64 
 	return dst
 }
 
-func requiredScore(tokenCount int, simTh float64) int {
+func (m *Matcher) requiredScore(tokenCount int, simTh float64) int {
+	if simTh == m.cfg.MatchThreshold && tokenCount >= 0 && tokenCount < len(m.matchNeeded) {
+		return m.matchNeeded[tokenCount]
+	}
 	return int(math.Ceil(simTh * float64(tokenCount)))
+}
+
+func (m *Matcher) rebuildMatchNeeded() {
+	m.matchNeeded = make([]int, len(m.rootByLen))
+	for tokenCount := range len(m.matchNeeded) {
+		m.matchNeeded[tokenCount] = int(math.Ceil(m.cfg.MatchThreshold * float64(tokenCount)))
+	}
+}
+
+func (m *Matcher) rebuildMatchPrefilter() {
+	if !m.cfg.EnableMatchPrefilter {
+		m.prefilterBuckets = nil
+		return
+	}
+
+	var (
+		anyByTC   = make(map[int][]int)
+		firstByTC = make(map[int]map[uint64][]int)
+		lastByTC  = make(map[int]map[uint64][]int)
+		flByTC    = make(map[int]map[uint64][]int)
+		maxLen    = 0
+	)
+
+	for id := 1; id < len(m.clusters); id++ {
+		cluster := m.clusters[id]
+		if cluster == nil {
+			continue
+		}
+
+		tokenCount := len(cluster.tokenIDs)
+		if tokenCount > maxLen {
+			maxLen = tokenCount
+		}
+		if tokenCount == 0 {
+			anyByTC[0] = append(anyByTC[0], id)
+			continue
+		}
+
+		var (
+			firstID      = cluster.tokenIDs[0]
+			lastID       = cluster.tokenIDs[tokenCount-1]
+			firstIsParam = firstID == m.paramID
+			lastIsParam  = lastID == m.paramID
+		)
+		switch {
+		case firstIsParam && lastIsParam:
+			anyByTC[tokenCount] = append(anyByTC[tokenCount], id)
+		case !firstIsParam && lastIsParam:
+			if firstByTC[tokenCount] == nil {
+				firstByTC[tokenCount] = make(map[uint64][]int)
+			}
+			firstByTC[tokenCount][firstID] = append(firstByTC[tokenCount][firstID], id)
+		case firstIsParam && !lastIsParam:
+			if lastByTC[tokenCount] == nil {
+				lastByTC[tokenCount] = make(map[uint64][]int)
+			}
+			lastByTC[tokenCount][lastID] = append(lastByTC[tokenCount][lastID], id)
+		default:
+			if flByTC[tokenCount] == nil {
+				flByTC[tokenCount] = make(map[uint64][]int)
+			}
+			combined := (firstID << 32) | (lastID & 0xFFFFFFFF)
+			flByTC[tokenCount][combined] = append(flByTC[tokenCount][combined], id)
+		}
+	}
+
+	buckets := make([]prefilterBucket, maxLen+1)
+	for tc, ids := range anyByTC {
+		if tc < len(buckets) {
+			buckets[tc].any = ids
+		}
+	}
+	for tc, mm := range firstByTC {
+		if tc < len(buckets) {
+			buckets[tc].firstKeys, buckets[tc].firstVals = sortedU64Keys(mm)
+		}
+	}
+	for tc, mm := range lastByTC {
+		if tc < len(buckets) {
+			buckets[tc].lastKeys, buckets[tc].lastVals = sortedU64Keys(mm)
+		}
+	}
+	for tc, mm := range flByTC {
+		if tc < len(buckets) {
+			buckets[tc].flKeys, buckets[tc].flVals = sortedU64Keys(mm)
+		}
+	}
+
+	m.prefilterBuckets = buckets
+}
+
+func (m *Matcher) prefilterCandidatesCompact(tokens []string, tokenCount int, dst []int) ([]int, bool) {
+	b := &m.prefilterBuckets[tokenCount]
+	any := b.any
+
+	var first []int
+	var last []int
+	var firstLast []int
+	if tokenCount > 0 {
+		firstID, firstKnown := m.dictIDs[tokens[0]]
+		lastID, lastKnown := m.dictIDs[tokens[tokenCount-1]]
+		if firstKnown {
+			first = searchSortedU64(b.firstKeys, b.firstVals, firstID)
+		}
+		if lastKnown {
+			last = searchSortedU64(b.lastKeys, b.lastVals, lastID)
+		}
+		if firstKnown && lastKnown {
+			combined := (firstID << 32) | (lastID & 0xFFFFFFFF)
+			firstLast = searchSortedU64(b.flKeys, b.flVals, combined)
+		}
+	}
+	return mergePrefilterGroups(any, first, last, firstLast, dst)
+}
+
+func sortedU64Keys(m map[uint64][]int) ([]uint64, [][]int) {
+	keys := make([]uint64, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b uint64) int { return cmp.Compare(a, b) })
+	vals := make([][]int, len(keys))
+	for i, k := range keys {
+		vals[i] = m[k]
+	}
+	return keys, vals
+}
+
+func searchSortedU64(keys []uint64, vals [][]int, target uint64) []int {
+	lo, hi := 0, len(keys)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if keys[mid] == target {
+			return vals[mid]
+		}
+		if keys[mid] < target {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return nil
+}
+
+func mergePrefilterGroups(any, first, last, firstLast []int, dst []int) ([]int, bool) {
+	nonEmpty := 0
+	var single []int
+	total := 0
+	for _, group := range [...][]int{any, first, last, firstLast} {
+		if len(group) == 0 {
+			continue
+		}
+		nonEmpty++
+		single = group
+		total += len(group)
+	}
+	if nonEmpty == 0 {
+		return nil, false
+	}
+	if nonEmpty == 1 {
+		return single, true
+	}
+
+	out := dst[:0]
+	if cap(out) < total {
+		out = make([]int, 0, total)
+	}
+	out = append(out, any...)
+	out = append(out, first...)
+	out = append(out, last...)
+	out = append(out, firstLast...)
+	return out, true
 }
 

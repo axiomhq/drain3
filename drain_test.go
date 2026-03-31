@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/bits-and-blooms/bitset"
 )
@@ -846,6 +845,7 @@ func TestFullSweep(t *testing.T) {
 	const (
 		path       = "strs.json"
 		sampleRate = 0.10
+		matchRate  = 0.10 // subsample corpus for matching to keep runtime reasonable
 		seed       = 42
 	)
 
@@ -860,12 +860,6 @@ func TestFullSweep(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	totalRows := len(allLines)
-
-	var rawBytes int
-	for _, l := range allLines {
-		rawBytes += len(l)
-	}
 
 	rng := rand.New(rand.NewSource(seed))
 	var sample []string
@@ -875,124 +869,105 @@ func TestFullSweep(t *testing.T) {
 		}
 	}
 
+	// Subsample for matching — different seed so it's independent of training sample.
+	matchRNG := rand.New(rand.NewSource(seed + 1))
+	var matchLines []string
+	var matchRawBytes int
+	for _, l := range allLines {
+		if matchRNG.Float64() < matchRate {
+			matchLines = append(matchLines, l)
+			matchRawBytes += len(l)
+		}
+	}
+	matchRows := len(matchLines)
+
 	simThs := []float64{0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
-	topKs := []int{10, 25, 50, 100, 250, 500, 1000}
-	maxTokensVals := []int{32, 64, 128, 256}
-	maxBytesVals := []int{512, 1024, 2048}
+	topKs := []int{10, 50, 250, 1000}
 
 	type result struct {
 		simTh    float64
 		topK     int
-		maxTok   int
-		maxBytes int
 		hitPct   float64
-		savedMB  float64
 		savedPct float64
 		ratio    float64
-		matchMs  float64
-		trainMs  float64
 	}
 	var results []result
 
 	for _, simTh := range simThs {
-		for _, maxTok := range maxTokensVals {
-			for _, maxB := range maxBytesVals {
-				cfg := DefaultConfig()
-				cfg.SimilarityThreshold = simTh
-				cfg.MaxTokens = maxTok
-				cfg.MaxBytes = maxB
+		cfg := DefaultConfig()
+		cfg.SimilarityThreshold = simTh
 
-				trainStart := time.Now()
-				full, err := TrainWithConfig(sample, cfg)
-				trainElapsed := time.Since(trainStart)
-				if err != nil {
-					t.Fatalf("train: %v", err)
-				}
+		full, err := TrainWithConfig(sample, cfg)
+		if err != nil {
+			t.Fatalf("train: %v", err)
+		}
 
-				templates := full.Templates()
-				sort.Slice(templates, func(i, j int) bool { return templates[i].Count > templates[j].Count })
+		templates := full.Templates()
+		sort.Slice(templates, func(i, j int) bool { return templates[i].Count > templates[j].Count })
 
-				for _, topK := range topKs {
-					keep := templates
-					if topK < len(keep) {
-						keep = keep[:topK]
-					}
+		for _, topK := range topKs {
+			keep := templates
+			if topK < len(keep) {
+				keep = keep[:topK]
+			}
 
-					m, err := NewMatcherFromTemplates(full.Config(), keep)
-					if err != nil {
-						t.Fatalf("rebuild: %v", err)
-					}
+			m, err := NewMatcherFromTemplates(full.Config(), keep)
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
 
-					maxCID := 0
-					for _, tmpl := range keep {
-						if tmpl.ID > maxCID {
-							maxCID = tmpl.ID
-						}
-					}
-					remap := make([]uint32, maxCID+1)
-					for i := range remap {
-						remap[i] = ^uint32(0)
-					}
-					for denseID, tmpl := range keep {
-						remap[tmpl.ID] = uint32(denseID)
-					}
-
-					// Measure match speed (MatchID only, no alloc noise).
-					matchStart := time.Now()
-					var matchedCount int
-					for _, line := range allLines {
-						if _, ok := m.MatchID(line); ok {
-							matchedCount++
-						}
-					}
-					matchElapsed := time.Since(matchStart)
-
-					// Measure compressed size with full MatchInto.
-					scratch := make([]string, 0, 64)
-					compressedBytes := 0
-					for _, line := range allLines {
-						cid, args, ok := m.MatchInto(line, scratch[:0])
-						if !ok || cid <= 0 || cid >= len(remap) || remap[cid] == ^uint32(0) {
-							compressedBytes += len(line)
-							continue
-						}
-						compressedBytes += 4
-						for _, a := range args {
-							compressedBytes += len(a)
-						}
-					}
-					compressedBytes += (totalRows + 63) / 64 * 8
-					payload, _ := m.MarshalBinary()
-					compressedBytes += len(payload)
-
-					saved := rawBytes - compressedBytes
-					results = append(results, result{
-						simTh:    simTh,
-						topK:     topK,
-						maxTok:   maxTok,
-						maxBytes: maxB,
-						hitPct:   100 * float64(matchedCount) / float64(totalRows),
-						savedMB:  float64(saved) / (1 << 20),
-						savedPct: 100 * float64(saved) / float64(rawBytes),
-						ratio:    float64(rawBytes) / float64(compressedBytes),
-						matchMs:  float64(matchElapsed.Milliseconds()),
-						trainMs:  float64(trainElapsed.Milliseconds()),
-					})
+			maxCID := 0
+			for _, tmpl := range keep {
+				if tmpl.ID > maxCID {
+					maxCID = tmpl.ID
 				}
 			}
+			remap := make([]uint32, maxCID+1)
+			for i := range remap {
+				remap[i] = ^uint32(0)
+			}
+			for denseID, tmpl := range keep {
+				remap[tmpl.ID] = uint32(denseID)
+			}
+
+			scratch := make([]string, 0, 64)
+			var matchedCount int
+			compressedBytes := 0
+			for _, line := range matchLines {
+				cid, args, ok := m.MatchInto(line, scratch[:0])
+				if !ok || cid <= 0 || cid >= len(remap) || remap[cid] == ^uint32(0) {
+					compressedBytes += len(line)
+					continue
+				}
+				matchedCount++
+				compressedBytes += 4
+				for _, a := range args {
+					compressedBytes += len(a)
+				}
+			}
+			compressedBytes += (matchRows + 63) / 64 * 8
+			payload, _ := m.MarshalBinary()
+			compressedBytes += len(payload)
+
+			saved := matchRawBytes - compressedBytes
+			results = append(results, result{
+				simTh:    simTh,
+				topK:     topK,
+				hitPct:   100 * float64(matchedCount) / float64(matchRows),
+				savedPct: 100 * float64(saved) / float64(matchRawBytes),
+				ratio:    float64(matchRawBytes) / float64(compressedBytes),
+			})
 		}
 	}
 
-	// Sort by saved descending.
-	sort.Slice(results, func(i, j int) bool { return results[i].savedMB > results[j].savedMB })
+	sort.Slice(results, func(i, j int) bool { return results[i].ratio > results[j].ratio })
 
-	t.Logf("\n%-5s %-5s %-6s %-6s | %6s %8s %6s %5s %8s %8s",
-		"sim", "topK", "maxTok", "maxB", "hit%", "saved MB", "saved%", "ratio", "match ms", "train ms")
-	t.Logf("%s", strings.Repeat("-", 85))
+	t.Logf("\n%-5s %-5s | %6s %6s %5s",
+		"sim", "topK", "hit%", "saved%", "ratio")
+	t.Logf("%s", strings.Repeat("-", 38))
 	for _, r := range results {
-		t.Logf("%-5.1f %-5d %-6d %-6d | %5.1f%% %7.1f MB %5.1f%% %5.2fx %7.0f ms %7.0f ms",
-			r.simTh, r.topK, r.maxTok, r.maxBytes,
-			r.hitPct, r.savedMB, r.savedPct, r.ratio, r.matchMs, r.trainMs)
+		t.Logf("%-5.1f %-5d | %5.1f%% %5.1f%% %5.2fx",
+			r.simTh, r.topK, r.hitPct, r.savedPct, r.ratio)
 	}
 }
 
@@ -1000,6 +975,7 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 	const (
 		path       = "strs.json"
 		sampleRate = 0.10
+		matchRate  = 0.10
 		seed       = 42
 	)
 
@@ -1014,12 +990,6 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	totalRows := len(allLines)
-
-	var rawBytes int
-	for _, l := range allLines {
-		rawBytes += len(l)
-	}
 
 	rng := rand.New(rand.NewSource(seed))
 	var sample []string
@@ -1029,8 +999,19 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 		}
 	}
 
-	topKs := []int{10, 25, 50, 100, 250, 500, 1000}
-	simThs := []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
+	matchRNG := rand.New(rand.NewSource(seed + 1))
+	var matchLines []string
+	var matchRawBytes int
+	for _, l := range allLines {
+		if matchRNG.Float64() < matchRate {
+			matchLines = append(matchLines, l)
+			matchRawBytes += len(l)
+		}
+	}
+	matchRows := len(matchLines)
+
+	topKs := []int{10, 50, 250, 1000}
+	simThs := []float64{0.3, 0.5, 0.7, 0.9}
 
 	for _, simTh := range simThs {
 		cfg := DefaultConfig()
@@ -1072,7 +1053,7 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 			scratch := make([]string, 0, 64)
 			var matchedCount int
 			compressedBytes := 0
-			for _, line := range allLines {
+			for _, line := range matchLines {
 				cid, args, ok := m.MatchInto(line, scratch[:0])
 				if !ok || cid <= 0 || cid >= len(clusterToTemplate) || clusterToTemplate[cid] == ^uint32(0) {
 					compressedBytes += len(line)
@@ -1084,18 +1065,18 @@ func TestSimilarityTopKMatrix(t *testing.T) {
 					compressedBytes += len(a)
 				}
 			}
-			compressedBytes += (totalRows + 63) / 64 * 8
+			compressedBytes += (matchRows + 63) / 64 * 8
 			payload, _ := m.MarshalBinary()
 			compressedBytes += len(payload)
 
-			saved := rawBytes - compressedBytes
-			reduction := 100 * float64(saved) / float64(rawBytes)
+			saved := matchRawBytes - compressedBytes
+			reduction := 100 * float64(saved) / float64(matchRawBytes)
 
 			t.Logf("sim=%.1f top=%4d | hit=%.1f%% | %.1f MB saved (%.1f%%) | ratio=%.2fx",
 				simTh, topK,
-				100*float64(matchedCount)/float64(totalRows),
+				100*float64(matchedCount)/float64(matchRows),
 				float64(saved)/(1<<20), reduction,
-				float64(rawBytes)/float64(compressedBytes))
+				float64(matchRawBytes)/float64(compressedBytes))
 		}
 	}
 }

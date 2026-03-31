@@ -14,6 +14,7 @@ type Config struct {
 	ParamString              string
 	ParametrizeNumericTokens bool
 	ExtraDelimiters          []string
+	EnableMatchPrefilter     bool
 }
 
 // DefaultConfig returns default Drain settings.
@@ -27,6 +28,7 @@ func DefaultConfig() Config {
 		MaxBytes:                 1024,
 		ParamString:              "<*>",
 		ParametrizeNumericTokens: true,
+		EnableMatchPrefilter:     true,
 	}
 }
 

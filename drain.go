@@ -28,16 +28,28 @@ type Matcher struct {
 	templates []Template
 
 	// Rebuilt indexes — derived from cfg + templates by rebuildFromTemplates.
-	rootByLen []*node    // prefix tree keyed by token count
-	clusters  []*cluster // cluster ID → cluster, 0 is sentinel
-	dictIDs     map[string]uint64 // token string → numeric ID
-	dictNextID  uint64            // next token ID to assign
-	paramID     uint64            // numeric ID of cfg.ParamString
-	nextCluster int               // next cluster ID to assign
+	rootByLen        []*node           // prefix tree keyed by token count
+	clusters         []*cluster        // cluster ID → cluster, 0 is sentinel
+	dictIDs          map[string]uint64 // token string → numeric ID
+	dictNextID       uint64            // next token ID to assign
+	paramID          uint64            // numeric ID of cfg.ParamString
+	nextCluster      int               // next cluster ID to assign
+	prefilterBuckets []prefilterBucket // first/last-token prefilter index, keyed by token count
+	matchNeeded      []int             // precomputed ceil(MatchThreshold * tokenCount), keyed by token count
 
 	// Scratch buffers — reused across addLogMessage calls during training.
 	scratchIDs []uint64
 	scratchTok []string
+}
+
+type prefilterBucket struct {
+	any       []int
+	firstKeys []uint64
+	firstVals [][]int
+	lastKeys  []uint64
+	lastVals  [][]int
+	flKeys    []uint64
+	flVals    [][]int
 }
 
 type node struct {
@@ -46,21 +58,38 @@ type node struct {
 }
 
 type cluster struct {
-	id         int
-	size       int
-	paramCount int
-	tokenIDs   []uint64
-	tokenStr   []string
+	id          int
+	size        int
+	paramCount  int
+	tokenIDs    []uint64
+	tokenStr    []string
+	nonParamIdx []uint16
 }
 
 func newCluster(id int, tokenStr []string, tokenIDs []uint64, size int, paramID uint64) *cluster {
 	c := &cluster{id: id, size: size, tokenStr: tokenStr, tokenIDs: tokenIDs}
-	for _, tid := range tokenIDs {
+	np := make([]uint16, 0, len(tokenIDs))
+	for i, tid := range tokenIDs {
 		if tid == paramID {
 			c.paramCount++
+		} else {
+			np = append(np, uint16(i))
 		}
 	}
+	c.nonParamIdx = np
 	return c
+}
+
+func (c *cluster) rebuildNonParamIdx(paramID uint64) {
+	c.nonParamIdx = c.nonParamIdx[:0]
+	c.paramCount = 0
+	for i, tid := range c.tokenIDs {
+		if tid == paramID {
+			c.paramCount++
+		} else {
+			c.nonParamIdx = append(c.nonParamIdx, uint16(i))
+		}
+	}
 }
 
 func (c *cluster) extractArgsInto(lineTokens []string, paramID uint64, dst []string) []string {

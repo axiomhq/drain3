@@ -13,7 +13,7 @@ import (
 
 const (
 	payloadMagic   = "drn3"
-	payloadVersion = byte(3)
+	payloadVersion = byte(4)
 )
 
 // MarshalBinary serializes the matcher into a binary format.
@@ -171,6 +171,11 @@ func writeConfigBinary(w *bytes.Buffer, cfg Config) {
 	for _, d := range cfg.ExtraDelimiters {
 		writeString(w, d)
 	}
+	if cfg.EnableMatchPrefilter {
+		w.WriteByte(1)
+	} else {
+		w.WriteByte(0)
+	}
 }
 
 func readConfigBinary(r *bytes.Reader) (Config, error) {
@@ -229,6 +234,11 @@ func readConfigBinary(r *bytes.Reader) (Config, error) {
 		}
 	}
 
+	prefilterFlag, err := r.ReadByte()
+	if err != nil {
+		return Config{}, fmt.Errorf("read match prefilter flag: %w", err)
+	}
+
 	cfg := Config{
 		Depth:                    int(depth),
 		SimilarityThreshold:      simTh,
@@ -240,6 +250,7 @@ func readConfigBinary(r *bytes.Reader) (Config, error) {
 		ParamString:              param,
 		ParametrizeNumericTokens: flag == 1,
 		ExtraDelimiters:          delims,
+		EnableMatchPrefilter:     prefilterFlag == 1,
 	}
 	return normalizeConfig(cfg)
 }

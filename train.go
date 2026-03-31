@@ -25,6 +25,8 @@ func TrainWithConfig(samples []string, cfg Config) (*Matcher, error) {
 		m.addLogMessage(sample)
 	}
 	m.syncTemplatesFromClusters()
+	m.rebuildMatchPrefilter()
+	m.rebuildMatchNeeded()
 	return m, nil
 }
 
@@ -94,6 +96,8 @@ func (m *Matcher) rebuildFromTemplates(cfg Config, templates []Template) error {
 		}
 	}
 	next.syncTemplatesFromClusters()
+	next.rebuildMatchPrefilter()
+	next.rebuildMatchNeeded()
 
 	*m = *next
 	return nil
@@ -161,6 +165,7 @@ func (m *Matcher) addLogMessage(content string) {
 		return
 	}
 
+	changed := false
 	for i := 0; i < len(tokenIDs) && i < len(matchCluster.tokenIDs); i++ {
 		if matchCluster.tokenIDs[i] == m.paramID {
 			continue
@@ -169,7 +174,11 @@ func (m *Matcher) addLogMessage(content string) {
 			matchCluster.tokenIDs[i] = m.paramID
 			matchCluster.tokenStr[i] = m.cfg.ParamString
 			matchCluster.paramCount++
+			changed = true
 		}
+	}
+	if changed {
+		matchCluster.rebuildNonParamIdx(m.paramID)
 	}
 	matchCluster.size++
 }
