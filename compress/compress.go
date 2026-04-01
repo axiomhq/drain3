@@ -2,7 +2,6 @@ package compress
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -32,8 +31,7 @@ func Decompress(dc DrainCompressed) []string {
 	return lines
 }
 
-// Compress trains a drain3 matcher on a stride-sampled 10% of lines and
-// compresses all lines using the trained matcher.
+// Compress trains a drain3 matcher on a stride-sampled 10% of lines.
 func Compress(lines []string) (DrainCompressed, error) {
 	return CompressWithConfig(lines, drain3.DefaultConfig())
 }
@@ -48,8 +46,6 @@ func CompressWithConfig(lines []string, cfg drain3.Config) (DrainCompressed, err
 	return CompressWithMatcher(lines, matcher)
 }
 
-// strideSample takes non-overlapping blocks of blockSize lines, evenly spaced,
-// covering approximately frac of the total lines.
 func strideSample(lines []string, frac float64, blockSize int) []string {
 	total := len(lines)
 	sampleN := int(float64(total) * frac)
@@ -63,24 +59,25 @@ func strideSample(lines []string, frac float64, blockSize int) []string {
 	}
 	out := make([]string, 0, sampleN)
 	for start := 0; start < total && len(out) < sampleN; start += stride {
-		end := min(start+blockSize, total)
-		out = append(out, lines[start:end]...)
+		out = append(out, lines[start:min(start+blockSize, total)]...)
 	}
 	return out
 }
 
 // CompressWithMatcher compresses lines using a pre-trained matcher.
 // Templates matching fewer than 2 lines are demoted to unmatched.
+// Original drain3 template IDs are remapped to dense indices 0..N-1.
 func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompressed, error) {
+	// Build sparse ID → template lookup for matching.
 	templates := matcher.Templates()
-	tmplByID := make(map[int]drain3.Template, len(templates))
+	sparseByID := make(map[int]drain3.Template, len(templates))
 	for _, t := range templates {
-		tmplByID[t.ID] = t
+		sparseByID[t.ID] = t
 	}
 
-	// First pass: match all lines.
+	// First pass: match all lines using original sparse IDs.
 	bitmap := bitset.New(uint(len(lines)))
-	templateIDs := make([]int, 0, len(lines))
+	sparseIDs := make([]int, 0, len(lines))
 	rawArgs := make([][]string, 0, len(lines))
 	var unmatched []string
 	var buf [32]string
@@ -91,29 +88,29 @@ func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompress
 			continue
 		}
 		bitmap.Set(uint(i))
-		templateIDs = append(templateIDs, templateID)
+		sparseIDs = append(sparseIDs, templateID)
 		rawArgs = append(rawArgs, append([]string(nil), args...))
 	}
 
-	// Demote templates with < 2 matches to unmatched.
-	tmplMatchCount := make(map[int]int, len(tmplByID))
-	for _, id := range templateIDs {
-		tmplMatchCount[id]++
+	// Demote templates with < 2 matches.
+	sparseMatchCount := make(map[int]int, len(sparseByID))
+	for _, id := range sparseIDs {
+		sparseMatchCount[id]++
 	}
 
 	newBitmap := bitset.New(uint(len(lines)))
-	var newTemplateIDs []int
-	var newRawArgs [][]string
+	var keptSparseIDs []int
+	var keptRawArgs [][]string
 	var newUnmatched []string
 	matchIdx := 0
 	unmatchIdx := 0
 	for i := range len(lines) {
 		if bitmap.Test(uint(i)) {
-			id := templateIDs[matchIdx]
-			if tmplMatchCount[id] >= 2 {
+			id := sparseIDs[matchIdx]
+			if sparseMatchCount[id] >= 2 {
 				newBitmap.Set(uint(i))
-				newTemplateIDs = append(newTemplateIDs, id)
-				newRawArgs = append(newRawArgs, rawArgs[matchIdx])
+				keptSparseIDs = append(keptSparseIDs, id)
+				keptRawArgs = append(keptRawArgs, rawArgs[matchIdx])
 			} else {
 				newUnmatched = append(newUnmatched, lines[i])
 			}
@@ -124,77 +121,112 @@ func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompress
 		}
 	}
 
-	// Remove demoted templates.
-	activeTmpls := make(map[int]drain3.Template)
-	for _, id := range newTemplateIDs {
-		if _, ok := activeTmpls[id]; !ok {
-			activeTmpls[id] = tmplByID[id]
-		}
+	// Remap sparse IDs → dense indices 0..N-1.
+	// Collect unique sparse IDs in sorted order for determinism.
+	uniqueSparse := make(map[int]bool)
+	for _, id := range keptSparseIDs {
+		uniqueSparse[id] = true
+	}
+	sortedSparse := make([]int, 0, len(uniqueSparse))
+	for id := range uniqueSparse {
+		sortedSparse = append(sortedSparse, id)
+	}
+	slices.Sort(sortedSparse)
+
+	sparseToIndex := make(map[int]uint16, len(sortedSparse))
+	tmplSlice := make([]drain3.Template, len(sortedSparse))
+	for i, sid := range sortedSparse {
+		sparseToIndex[sid] = uint16(i)
+		tmplSlice[i] = sparseByID[sid]
+	}
+
+	// Remap templateIDs to dense indices.
+	templateIDs := make([]uint16, len(keptSparseIDs))
+	for i, sid := range keptSparseIDs {
+		templateIDs[i] = sparseToIndex[sid]
 	}
 
 	c := &compressed{
-		tmplByID:    activeTmpls,
-		lineCount:   len(lines),
+		templates:   tmplSlice,
+		lineCount:   uint32(len(lines)),
 		bitmap:      newBitmap,
-		templateIDs: newTemplateIDs,
+		templateIDs: templateIDs,
 		unmatched:   newUnmatched,
 	}
-	c.buildColumnArgs(newRawArgs)
+	c.buildColumnArgs(keptRawArgs)
 	return c, nil
 }
 
-// templateArgs holds dictionary-encoded columnar arg storage for one template.
+// templateArgs holds dictionary-encoded columnar args for one template.
 type templateArgs struct {
-	dicts   [][]string // dicts[col] = unique string values for this column
-	indices [][]int    // indices[col][row] = index into dicts[col]
+	// serialized: uint32 LE dict entry count + string lengths/bytes per column
+	dicts [][]string
+	// serialized: uint32 LE per entry (flat block, all templates concatenated)
+	indices [][]uint32
 }
 
+// compressed holds the in-memory representation.
 type compressed struct {
-	tmplByID    map[int]drain3.Template
-	lineCount   int
-	bitmap      *bitset.BitSet
-	templateIDs []int
-	argCols     map[int]*templateArgs
-	rowIdx      []int
-	unmatched   []string
-	reconBuf    []byte   // reusable; not safe for concurrent use
-	argBuf      []string // reusable; not safe for concurrent use
+	// --- serialized fields ---
+
+	// serialized: uint32 LE
+	lineCount uint32
+	// serialized: uint32 word count + []uint64 LE words
+	bitmap *bitset.BitSet
+	// serialized: uint32 count + uint16 LE per entry (dense index into templates)
+	templateIDs []uint16
+	// serialized: uint16 count, then per template (in index order):
+	//   uint32 Count, uint16 TokenCount,
+	//   uint16 paramWordCount + []uint64 LE,
+	//   uint16 tokenCount + (uint32 len + bytes) per token
+	templates []drain3.Template
+	// serialized: parallel to templates — per template with params:
+	//   uint16 nCols, then per col: uint32 dictSize + uint32 idxCount
+	// dict strings: uint32 total + uint32 LE lengths + raw bytes
+	// indices: uint32 total + uint32 LE values (flat block)
+	argCols []*templateArgs // len == len(templates), nil for templates with no params
+	// serialized: uint32 count + uint32 LE lengths + raw bytes
+	unmatched []string
+
+	// --- NOT serialized (reconstructed or transient) ---
+
+	rowIdx   []uint32 // reconstructed from templateIDs
+	reconBuf []byte   // reusable scratch; not safe for concurrent use
+	argBuf   []string // reusable scratch; not safe for concurrent use
 }
 
-// buildColumnArgs converts row-based rawArgs into dictionary-encoded columnar storage.
 func (c *compressed) buildColumnArgs(rawArgs [][]string) {
-	c.rowIdx = make([]int, len(c.templateIDs))
-	tmplRowCount := make(map[int]int, len(c.tmplByID))
+	c.rowIdx = make([]uint32, len(c.templateIDs))
+	tmplRowCount := make([]uint32, len(c.templates))
 	for matchIdx, id := range c.templateIDs {
 		c.rowIdx[matchIdx] = tmplRowCount[id]
 		tmplRowCount[id]++
 	}
 
 	type dictBuilder struct {
-		lookup map[string]int
+		lookup map[string]uint32
 		values []string
 	}
 
-	c.argCols = make(map[int]*templateArgs, len(tmplRowCount))
-	builders := make(map[int][]dictBuilder, len(tmplRowCount))
+	c.argCols = make([]*templateArgs, len(c.templates))
+	builders := make([][]dictBuilder, len(c.templates))
 
 	for id, rowCount := range tmplRowCount {
-		nCols := int(c.tmplByID[id].Params.Count())
-		if nCols == 0 {
+		nCols := int(c.templates[id].Params.Count())
+		if nCols == 0 || rowCount == 0 {
 			continue
 		}
 		ta := &templateArgs{
 			dicts:   make([][]string, nCols),
-			indices: make([][]int, nCols),
+			indices: make([][]uint32, nCols),
 		}
 		for col := range nCols {
-			ta.indices[col] = make([]int, rowCount)
+			ta.indices[col] = make([]uint32, rowCount)
 		}
 		c.argCols[id] = ta
-
 		bs := make([]dictBuilder, nCols)
 		for i := range bs {
-			bs[i].lookup = make(map[string]int)
+			bs[i].lookup = make(map[string]uint32)
 		}
 		builders[id] = bs
 	}
@@ -209,7 +241,7 @@ func (c *compressed) buildColumnArgs(rawArgs [][]string) {
 		for col, val := range rawArgs[matchIdx] {
 			idx, ok := bs[col].lookup[val]
 			if !ok {
-				idx = len(bs[col].values)
+				idx = uint32(len(bs[col].values))
 				bs[col].lookup[val] = idx
 				bs[col].values = append(bs[col].values, val)
 			}
@@ -218,6 +250,9 @@ func (c *compressed) buildColumnArgs(rawArgs [][]string) {
 	}
 
 	for id, bs := range builders {
+		if bs == nil {
+			continue
+		}
 		ta := c.argCols[id]
 		for col := range bs {
 			ta.dicts[col] = bs[col].values
@@ -225,10 +260,9 @@ func (c *compressed) buildColumnArgs(rawArgs [][]string) {
 	}
 }
 
-// Len returns the number of lines.
-func (c *compressed) Len() int { return c.lineCount }
+func (c *compressed) Len() int { return int(c.lineCount) }
 
-func (c *compressed) gatherArgs(id int, row int) []string {
+func (c *compressed) gatherArgs(id uint16, row uint32) []string {
 	ta := c.argCols[id]
 	if ta == nil {
 		return c.argBuf[:0]
@@ -240,24 +274,19 @@ func (c *compressed) gatherArgs(id int, row int) []string {
 	return c.argBuf
 }
 
-// ValueAt reconstructs the string at position i. Panics if out of range.
 func (c *compressed) ValueAt(i int) string {
-	if i < 0 || i >= c.lineCount {
+	if i < 0 || i >= int(c.lineCount) {
 		panic(fmt.Sprintf("compress: index %d out of range [0, %d)", i, c.lineCount))
 	}
 	ui := uint(i)
 	if c.bitmap.Test(ui) {
 		matchIdx := int(c.bitmap.Rank(ui)) - 1
 		id := c.templateIDs[matchIdx]
-		tmpl := c.tmplByID[id]
-		args := c.gatherArgs(id, c.rowIdx[matchIdx])
-		return c.reconstruct(tmpl, args)
+		return c.reconstruct(c.templates[id], c.gatherArgs(id, c.rowIdx[matchIdx]))
 	}
-	unmatchIdx := i - int(c.bitmap.Rank(ui))
-	return c.unmatched[unmatchIdx]
+	return c.unmatched[i-int(c.bitmap.Rank(ui))]
 }
 
-// decompressAll reconstructs all lines via a linear bitmap walk.
 func (c *compressed) decompressAll() []string {
 	lines := make([]string, c.lineCount)
 	matchIdx := 0
@@ -265,9 +294,7 @@ func (c *compressed) decompressAll() []string {
 	for i := range c.lineCount {
 		if c.bitmap.Test(uint(i)) {
 			id := c.templateIDs[matchIdx]
-			tmpl := c.tmplByID[id]
-			args := c.gatherArgs(id, c.rowIdx[matchIdx])
-			lines[i] = c.reconstruct(tmpl, args)
+			lines[i] = c.reconstruct(c.templates[id], c.gatherArgs(id, c.rowIdx[matchIdx]))
 			matchIdx++
 		} else {
 			lines[i] = c.unmatched[unmatchIdx]
@@ -279,337 +306,321 @@ func (c *compressed) decompressAll() []string {
 
 const compressMagic = "dc01"
 
-// countWriter wraps a buffered writer with byte counting and sticky errors.
-type countWriter struct {
+type stickyWriter struct {
 	bw      *bufio.Writer
 	n       int64
 	err     error
-	scratch [binary.MaxVarintLen64]byte
+	scratch [8]byte
 }
 
-func (cw *countWriter) write(p []byte) {
-	if cw.err != nil {
+func (sw *stickyWriter) write(p []byte) {
+	if sw.err != nil {
 		return
 	}
-	n, err := cw.bw.Write(p)
-	cw.n += int64(n)
-	cw.err = err
+	n, err := sw.bw.Write(p)
+	sw.n += int64(n)
+	sw.err = err
 }
 
-func (cw *countWriter) writeString(s string) {
-	if cw.err != nil {
+func (sw *stickyWriter) writeString(s string) {
+	if sw.err != nil {
 		return
 	}
-	n, err := cw.bw.WriteString(s)
-	cw.n += int64(n)
-	cw.err = err
+	n, err := sw.bw.WriteString(s)
+	sw.n += int64(n)
+	sw.err = err
 }
 
-func (cw *countWriter) flush() {
-	if cw.err != nil {
+func (sw *stickyWriter) u16(v uint16) {
+	binary.LittleEndian.PutUint16(sw.scratch[:2], v)
+	sw.write(sw.scratch[:2])
+}
+
+func (sw *stickyWriter) u32(v uint32) {
+	binary.LittleEndian.PutUint32(sw.scratch[:4], v)
+	sw.write(sw.scratch[:4])
+}
+
+func (sw *stickyWriter) u64(v uint64) {
+	binary.LittleEndian.PutUint64(sw.scratch[:8], v)
+	sw.write(sw.scratch[:8])
+}
+
+func (sw *stickyWriter) flush() {
+	if sw.err != nil {
 		return
 	}
-	cw.err = cw.bw.Flush()
+	sw.err = sw.bw.Flush()
 }
 
-// WriteTo serializes the compressed representation.
-// The output is designed to be maximally compressible by zstd.
+// WriteTo serializes using a type-separated, fixed-width layout
+// optimized for zstd.
 func (c *compressed) WriteTo(w io.Writer) (int64, error) {
-	cw := &countWriter{bw: bufio.NewWriter(w)}
+	sw := &stickyWriter{bw: bufio.NewWriter(w)}
 
-	// Header.
-	copy(cw.scratch[:4], compressMagic)
-	cw.write(cw.scratch[:4])
-	writeUvarint(cw, uint64(c.lineCount))
+	sw.write([]byte(compressMagic))
+	sw.u32(c.lineCount)
+
+	// === INTEGERS ===
 
 	// Bitmap.
 	words := c.bitmap.Words()
-	writeUvarint(cw, uint64(len(words)))
+	sw.u32(uint32(len(words)))
 	for _, word := range words {
-		binary.LittleEndian.PutUint64(cw.scratch[:8], word)
-		cw.write(cw.scratch[:8])
+		sw.u64(word)
 	}
 
-	// Templates sorted by ID.
-	tmplIDs := make([]int, 0, len(c.tmplByID))
-	for id := range c.tmplByID {
-		tmplIDs = append(tmplIDs, id)
-	}
-	slices.Sort(tmplIDs)
-
-	writeUvarint(cw, uint64(len(tmplIDs)))
-	for _, id := range tmplIDs {
-		t := c.tmplByID[id]
-		writeVarint(cw, int64(t.ID))
-		writeVarint(cw, int64(t.Count))
-		writeUvarint(cw, uint64(t.TokenCount))
-
-		paramWords := t.Params.Words()
-		writeUvarint(cw, uint64(len(paramWords)))
-		for _, pw := range paramWords {
-			binary.LittleEndian.PutUint64(cw.scratch[:8], pw)
-			cw.write(cw.scratch[:8])
-		}
-
-		writeUvarint(cw, uint64(len(t.Tokens)))
-		for _, tok := range t.Tokens {
-			writeString(cw, tok)
-		}
-	}
-
-	// TemplateIDs.
-	writeUvarint(cw, uint64(len(c.templateIDs)))
+	// TemplateIDs — uint16 LE dense indices.
+	sw.u32(uint32(len(c.templateIDs)))
 	for _, id := range c.templateIDs {
-		writeVarint(cw, int64(id))
+		sw.u16(id)
 	}
 
-	// Columnar args.
-	var argColIDs []int
-	for _, id := range tmplIDs {
-		if _, ok := c.argCols[id]; ok {
-			argColIDs = append(argColIDs, id)
+	// Flat column indices — uint32 LE.
+	totalIndices := uint32(0)
+	for _, ta := range c.argCols {
+		if ta == nil {
+			continue
+		}
+		for col := range ta.indices {
+			totalIndices += uint32(len(ta.indices[col]))
 		}
 	}
-	writeUvarint(cw, uint64(len(argColIDs)))
-	for _, id := range argColIDs {
-		ta := c.argCols[id]
-		writeVarint(cw, int64(id))
-		writeUvarint(cw, uint64(len(ta.dicts)))
-		for col := range ta.dicts {
-			writeUvarint(cw, uint64(len(ta.dicts[col])))
-			for _, s := range ta.dicts[col] {
-				writeString(cw, s)
-			}
-			writeUvarint(cw, uint64(len(ta.indices[col])))
+	sw.u32(totalIndices)
+	for _, ta := range c.argCols {
+		if ta == nil {
+			continue
+		}
+		for col := range ta.indices {
 			for _, idx := range ta.indices[col] {
-				writeUvarint(cw, uint64(idx))
+				sw.u32(idx)
 			}
 		}
 	}
 
-	// Unmatched.
-	writeUvarint(cw, uint64(len(c.unmatched)))
+	// === TEMPLATES ===
+
+	sw.u16(uint16(len(c.templates)))
+	for _, t := range c.templates {
+		sw.u32(uint32(t.Count))
+		sw.u16(uint16(t.TokenCount))
+		pw := t.Params.Words()
+		sw.u16(uint16(len(pw)))
+		for _, w := range pw {
+			sw.u64(w)
+		}
+		sw.u16(uint16(len(t.Tokens)))
+		for _, tok := range t.Tokens {
+			sw.u32(uint32(len(tok)))
+			sw.writeString(tok)
+		}
+	}
+
+	// === COLUMN STRUCTURE ===
+	// Per template (in order): nCols, then per col: dictSize + idxCount.
+	// Templates with no params write nCols=0.
+
+	for _, ta := range c.argCols {
+		if ta == nil {
+			sw.u16(0)
+			continue
+		}
+		sw.u16(uint16(len(ta.dicts)))
+		for col := range ta.dicts {
+			sw.u32(uint32(len(ta.dicts[col])))
+			sw.u32(uint32(len(ta.indices[col])))
+		}
+	}
+
+	// === STRINGS: dict entries (lengths then bytes) ===
+
+	totalDE := uint32(0)
+	for _, ta := range c.argCols {
+		if ta == nil {
+			continue
+		}
+		for col := range ta.dicts {
+			totalDE += uint32(len(ta.dicts[col]))
+		}
+	}
+	sw.u32(totalDE)
+	for _, ta := range c.argCols {
+		if ta == nil {
+			continue
+		}
+		for col := range ta.dicts {
+			for _, s := range ta.dicts[col] {
+				sw.u32(uint32(len(s)))
+			}
+		}
+	}
+	for _, ta := range c.argCols {
+		if ta == nil {
+			continue
+		}
+		for col := range ta.dicts {
+			for _, s := range ta.dicts[col] {
+				sw.writeString(s)
+			}
+		}
+	}
+
+	// === STRINGS: unmatched (lengths then bytes) ===
+
+	sw.u32(uint32(len(c.unmatched)))
 	for _, s := range c.unmatched {
-		writeString(cw, s)
+		sw.u32(uint32(len(s)))
+	}
+	for _, s := range c.unmatched {
+		sw.writeString(s)
 	}
 
-	cw.flush()
-	return cw.n, cw.err
+	sw.flush()
+	return sw.n, sw.err
 }
 
-func safeReadUvarint(br *bytes.Reader, label string) (uint64, error) {
-	count, err := readUvarint(br)
-	if err != nil {
-		return 0, fmt.Errorf("compress: read %s: %w", label, err)
-	}
-	if count > uint64(br.Len()) {
-		return 0, fmt.Errorf("compress: %s count %d exceeds remaining bytes %d", label, count, br.Len())
-	}
-	return count, nil
-}
-
-// ReadFrom deserializes a DrainCompressed from r.
+// ReadFrom deserializes a DrainCompressed.
 func ReadFrom(r io.Reader) (DrainCompressed, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
-	br := bytes.NewReader(data)
-
-	magic := make([]byte, len(compressMagic))
-	if _, err := io.ReadFull(br, magic); err != nil {
-		return nil, fmt.Errorf("compress: read magic: %w", err)
-	}
-	if string(magic) != compressMagic {
-		return nil, fmt.Errorf("compress: invalid magic %q", magic)
+	if len(data) < 4 || string(data[:4]) != compressMagic {
+		return nil, fmt.Errorf("compress: invalid magic")
 	}
 
-	lineCount, err := readUvarint(br)
-	if err != nil {
-		return nil, fmt.Errorf("compress: read line count: %w", err)
-	}
+	rd := &reader{data: data, pos: 4}
+
+	lineCount := rd.u32()
 
 	// Bitmap.
-	wordCount, err := safeReadUvarint(br, "bitmap word count")
-	if err != nil {
-		return nil, err
-	}
+	wordCount := rd.u32()
 	words := make([]uint64, wordCount)
 	for j := range words {
-		if err := binary.Read(br, binary.LittleEndian, &words[j]); err != nil {
-			return nil, fmt.Errorf("compress: read bitmap word: %w", err)
-		}
+		words[j] = rd.u64()
 	}
 	bm := bitset.From(words)
 
-	// Templates.
-	tmplCount, err := safeReadUvarint(br, "template count")
-	if err != nil {
-		return nil, err
+	// TemplateIDs.
+	matchCount := rd.u32()
+	templateIDs := make([]uint16, matchCount)
+	for i := range templateIDs {
+		templateIDs[i] = rd.u16()
 	}
-	tmplByID := make(map[int]drain3.Template, tmplCount)
-	for range tmplCount {
-		id, err := readVarint(br)
-		if err != nil {
-			return nil, fmt.Errorf("compress: read template id: %w", err)
-		}
-		count, err := readVarint(br)
-		if err != nil {
-			return nil, fmt.Errorf("compress: read template count: %w", err)
-		}
-		tokenCount, err := readUvarint(br)
-		if err != nil {
-			return nil, fmt.Errorf("compress: read token count: %w", err)
-		}
 
-		pwCount, err := safeReadUvarint(br, "param word count")
-		if err != nil {
-			return nil, err
-		}
+	// Flat indices.
+	totalIdx := rd.u32()
+	flatIndices := make([]uint32, totalIdx)
+	for i := range flatIndices {
+		flatIndices[i] = rd.u32()
+	}
+
+	// Templates.
+	tmplCount := rd.u16()
+	templates := make([]drain3.Template, tmplCount)
+	for i := range templates {
+		count := rd.u32()
+		tokenCount := rd.u16()
+		pwCount := rd.u16()
 		pwords := make([]uint64, pwCount)
 		for j := range pwords {
-			if err := binary.Read(br, binary.LittleEndian, &pwords[j]); err != nil {
-				return nil, fmt.Errorf("compress: read param word: %w", err)
-			}
+			pwords[j] = rd.u64()
 		}
-
-		denseCount, err := safeReadUvarint(br, "dense token count")
-		if err != nil {
-			return nil, err
-		}
-		tokens := make([]string, denseCount)
+		nToks := rd.u16()
+		tokens := make([]string, nToks)
 		for j := range tokens {
-			tokens[j], err = readStringDirect(br, data)
-			if err != nil {
-				return nil, fmt.Errorf("compress: read token: %w", err)
-			}
+			tokens[j] = rd.str()
 		}
-
-		tmplByID[int(id)] = drain3.Template{
-			ID:         int(id),
-			Tokens:     tokens,
-			Params:     bitset.From(pwords),
-			TokenCount: int(tokenCount),
-			Count:      int(count),
+		templates[i] = drain3.Template{
+			ID: i, Count: int(count), TokenCount: int(tokenCount),
+			Tokens: tokens, Params: bitset.From(pwords),
 		}
 	}
 
-	// TemplateIDs.
-	matchCount, err := safeReadUvarint(br, "match count")
-	if err != nil {
-		return nil, err
+	// Column structure + reconstruct argCols.
+	argCols := make([]*templateArgs, tmplCount)
+	dictOff := 0
+	idxOff := 0
+
+	// First pass: read structure to know sizes.
+	type colMeta struct {
+		nCols     int
+		dictSizes []uint32
+		idxCounts []uint32
 	}
-	templateIDs := make([]int, matchCount)
-	for i := range templateIDs {
-		v, err := readVarint(br)
-		if err != nil {
-			return nil, fmt.Errorf("compress: read template id: %w", err)
+	metas := make([]colMeta, tmplCount)
+	for i := range metas {
+		nCols := rd.u16()
+		m := colMeta{nCols: int(nCols), dictSizes: make([]uint32, nCols), idxCounts: make([]uint32, nCols)}
+		for col := range nCols {
+			m.dictSizes[col] = rd.u32()
+			m.idxCounts[col] = rd.u32()
 		}
-		templateIDs[i] = int(v)
+		metas[i] = m
 	}
 
-	// Columnar args.
-	argColCount, err := safeReadUvarint(br, "arg columns count")
-	if err != nil {
-		return nil, err
+	// Dict strings.
+	totalDE := rd.u32()
+	dictLens := make([]uint32, totalDE)
+	for i := range dictLens {
+		dictLens[i] = rd.u32()
 	}
-	argCols := make(map[int]*templateArgs, argColCount)
-	for range argColCount {
-		id, err := readVarint(br)
-		if err != nil {
-			return nil, fmt.Errorf("compress: read arg template id: %w", err)
-		}
-		nCols, err := safeReadUvarint(br, "column count")
-		if err != nil {
-			return nil, err
+	dictStrs := make([]string, totalDE)
+	for i := range dictStrs {
+		dictStrs[i] = rd.strN(int(dictLens[i]))
+	}
+
+	// Assemble argCols.
+	for i, m := range metas {
+		if m.nCols == 0 {
+			continue
 		}
 		ta := &templateArgs{
-			dicts:   make([][]string, nCols),
-			indices: make([][]int, nCols),
+			dicts:   make([][]string, m.nCols),
+			indices: make([][]uint32, m.nCols),
 		}
-		for col := range nCols {
-			dictSize, err := safeReadUvarint(br, "dict size")
-			if err != nil {
-				return nil, err
-			}
-			ta.dicts[col] = make([]string, dictSize)
-			for j := range dictSize {
-				ta.dicts[col][j], err = readStringDirect(br, data)
-				if err != nil {
-					return nil, fmt.Errorf("compress: read dict entry: %w", err)
-				}
-			}
-			numIndices, err := safeReadUvarint(br, "indices count")
-			if err != nil {
-				return nil, err
-			}
-			ta.indices[col] = make([]int, numIndices)
-			for j := range numIndices {
-				v, err := readUvarint(br)
-				if err != nil {
-					return nil, fmt.Errorf("compress: read index: %w", err)
-				}
-				ta.indices[col][j] = int(v)
-			}
+		for col := range m.nCols {
+			ta.dicts[col] = dictStrs[dictOff : dictOff+int(m.dictSizes[col])]
+			dictOff += int(m.dictSizes[col])
+			ta.indices[col] = flatIndices[idxOff : idxOff+int(m.idxCounts[col])]
+			idxOff += int(m.idxCounts[col])
 		}
-		argCols[int(id)] = ta
+		argCols[i] = ta
 	}
 
-	// Unmatched.
-	unmatchedCount, err := safeReadUvarint(br, "unmatched count")
-	if err != nil {
-		return nil, err
+	// Unmatched strings.
+	unmCount := rd.u32()
+	unmLens := make([]uint32, unmCount)
+	for i := range unmLens {
+		unmLens[i] = rd.u32()
 	}
-	unmatched := make([]string, unmatchedCount)
+	unmatched := make([]string, unmCount)
 	for i := range unmatched {
-		unmatched[i], err = readStringDirect(br, data)
-		if err != nil {
-			return nil, fmt.Errorf("compress: read unmatched: %w", err)
-		}
+		unmatched[i] = rd.strN(int(unmLens[i]))
 	}
 
-	if br.Len() != 0 {
-		return nil, fmt.Errorf("compress: %d unexpected trailing bytes", br.Len())
+	if rd.err != nil {
+		return nil, fmt.Errorf("compress: %w", rd.err)
+	}
+	if rd.pos != len(data) {
+		return nil, fmt.Errorf("compress: %d trailing bytes", len(data)-rd.pos)
 	}
 
-	// Validate.
-	if len(templateIDs) != int(bm.Count()) {
-		return nil, fmt.Errorf("compress: templateIDs length %d does not match bitmap popcount %d", len(templateIDs), bm.Count())
-	}
-	for i, id := range templateIDs {
-		if _, ok := tmplByID[id]; !ok {
-			return nil, fmt.Errorf("compress: templateIDs[%d] references unknown template id %d", i, id)
-		}
-	}
-	tmplRowCount := make(map[int]int, len(argCols))
-	for _, id := range templateIDs {
-		tmplRowCount[id]++
-	}
-	for id, ta := range argCols {
-		expected := tmplRowCount[id]
-		for col := range ta.indices {
-			if len(ta.indices[col]) != expected {
-				return nil, fmt.Errorf("compress: template %d column %d has %d rows, expected %d", id, col, len(ta.indices[col]), expected)
-			}
-			for _, idx := range ta.indices[col] {
-				if idx < 0 || idx >= len(ta.dicts[col]) {
-					return nil, fmt.Errorf("compress: template %d column %d index %d out of range [0, %d)", id, col, idx, len(ta.dicts[col]))
-				}
-			}
-		}
+	if uint32(len(templateIDs)) != uint32(bm.Count()) {
+		return nil, fmt.Errorf("compress: templateIDs length %d != bitmap popcount %d", len(templateIDs), bm.Count())
 	}
 
 	// Reconstruct rowIdx.
-	rowIdx := make([]int, len(templateIDs))
-	clear(tmplRowCount)
+	rowIdx := make([]uint32, len(templateIDs))
+	tmplRowCount := make([]uint32, tmplCount)
 	for i, id := range templateIDs {
 		rowIdx[i] = tmplRowCount[id]
 		tmplRowCount[id]++
 	}
 
 	return &compressed{
-		tmplByID:    tmplByID,
-		lineCount:   int(lineCount),
+		templates:   templates,
+		lineCount:   lineCount,
 		bitmap:      bm,
 		templateIDs: templateIDs,
 		argCols:     argCols,
@@ -619,15 +630,6 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 }
 
 func (c *compressed) reconstruct(tmpl drain3.Template, args []string) string {
-	paramCount := int(tmpl.Params.Count())
-	if len(args) != paramCount {
-		panic(fmt.Sprintf("compress: reconstruct: template %d has %d params but got %d args", tmpl.ID, paramCount, len(args)))
-	}
-	denseCount := tmpl.TokenCount - paramCount
-	if len(tmpl.Tokens) != denseCount {
-		panic(fmt.Sprintf("compress: reconstruct: template %d expects %d dense tokens but has %d", tmpl.ID, denseCount, len(tmpl.Tokens)))
-	}
-
 	c.reconBuf = c.reconBuf[:0]
 	denseIdx := 0
 	argIdx := 0
@@ -646,45 +648,61 @@ func (c *compressed) reconstruct(tmpl drain3.Template, args []string) string {
 	return string(c.reconBuf)
 }
 
-// Binary helpers.
-
-func writeUvarint(cw *countWriter, v uint64) {
-	n := binary.PutUvarint(cw.scratch[:], v)
-	cw.write(cw.scratch[:n])
+type reader struct {
+	data []byte
+	pos  int
+	err  error
 }
 
-func writeVarint(cw *countWriter, v int64) {
-	n := binary.PutVarint(cw.scratch[:], v)
-	cw.write(cw.scratch[:n])
-}
-
-func writeString(cw *countWriter, s string) {
-	writeUvarint(cw, uint64(len(s)))
-	cw.writeString(s)
-}
-
-func readUvarint(r *bytes.Reader) (uint64, error) {
-	return binary.ReadUvarint(r)
-}
-
-func readVarint(r *bytes.Reader) (int64, error) {
-	return binary.ReadVarint(r)
-}
-
-func readStringDirect(br *bytes.Reader, data []byte) (string, error) {
-	n, err := binary.ReadUvarint(br)
-	if err != nil {
-		return "", err
+func (r *reader) need(n int) []byte {
+	if r.err != nil {
+		return nil
 	}
-	if n > uint64(br.Len()) {
-		return "", io.ErrUnexpectedEOF
+	if r.pos+n > len(r.data) {
+		r.err = io.ErrUnexpectedEOF
+		return nil
 	}
+	b := r.data[r.pos : r.pos+n]
+	r.pos += n
+	return b
+}
+
+func (r *reader) u16() uint16 {
+	b := r.need(2)
+	if b == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(b)
+}
+
+func (r *reader) u32() uint32 {
+	b := r.need(4)
+	if b == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(b)
+}
+
+func (r *reader) u64() uint64 {
+	b := r.need(8)
+	if b == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(b)
+}
+
+func (r *reader) str() string {
+	n := r.u32()
+	return r.strN(int(n))
+}
+
+func (r *reader) strN(n int) string {
 	if n == 0 {
-		return "", nil
+		return ""
 	}
-	start := len(data) - br.Len()
-	if _, err := br.Seek(int64(n), io.SeekCurrent); err != nil {
-		return "", err
+	b := r.need(n)
+	if b == nil {
+		return ""
 	}
-	return string(data[start : start+int(n)]), nil
+	return string(b)
 }
