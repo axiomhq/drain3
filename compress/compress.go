@@ -9,6 +9,7 @@ import (
 
 	"github.com/axiomhq/drain3"
 	"github.com/bits-and-blooms/bitset"
+	"github.com/mhr3/streamvbyte"
 )
 
 // DrainCompressed provides random access to compressed lines and serialization.
@@ -68,14 +69,12 @@ func strideSample(lines []string, frac float64, blockSize int) []string {
 // Templates matching fewer than 2 lines are demoted to unmatched.
 // Original drain3 template IDs are remapped to dense indices 0..N-1.
 func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompressed, error) {
-	// Build sparse ID → template lookup for matching.
 	templates := matcher.Templates()
 	sparseByID := make(map[int]drain3.Template, len(templates))
 	for _, t := range templates {
 		sparseByID[t.ID] = t
 	}
 
-	// First pass: match all lines using original sparse IDs.
 	bitmap := bitset.New(uint(len(lines)))
 	sparseIDs := make([]int, 0, len(lines))
 	rawArgs := make([][]string, 0, len(lines))
@@ -92,7 +91,6 @@ func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompress
 		rawArgs = append(rawArgs, append([]string(nil), args...))
 	}
 
-	// Demote templates with < 2 matches.
 	sparseMatchCount := make(map[int]int, len(sparseByID))
 	for _, id := range sparseIDs {
 		sparseMatchCount[id]++
@@ -121,8 +119,6 @@ func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompress
 		}
 	}
 
-	// Remap sparse IDs → dense indices 0..N-1.
-	// Collect unique sparse IDs in sorted order for determinism.
 	uniqueSparse := make(map[int]bool)
 	for _, id := range keptSparseIDs {
 		uniqueSparse[id] = true
@@ -140,7 +136,6 @@ func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompress
 		tmplSlice[i] = sparseByID[sid]
 	}
 
-	// Remap templateIDs to dense indices.
 	templateIDs := make([]uint16, len(keptSparseIDs))
 	for i, sid := range keptSparseIDs {
 		templateIDs[i] = sparseToIndex[sid]
@@ -157,42 +152,24 @@ func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompress
 	return c, nil
 }
 
-// templateArgs holds dictionary-encoded columnar args for one template.
 type templateArgs struct {
-	// serialized: uint32 LE dict entry count + string lengths/bytes per column
-	dicts [][]string
-	// serialized: uint32 LE per entry (flat block, all templates concatenated)
+	dicts   [][]string
 	indices [][]uint32
 }
 
-// compressed holds the in-memory representation.
 type compressed struct {
-	// --- serialized fields ---
-
-	// serialized: uint32 LE
-	lineCount uint32
-	// serialized: uint32 word count + []uint64 LE words
-	bitmap *bitset.BitSet
-	// serialized: uint32 count + uint16 LE per entry (dense index into templates)
+	// --- serialized ---
+	lineCount   uint32
+	bitmap      *bitset.BitSet
 	templateIDs []uint16
-	// serialized: uint16 count, then per template (in index order):
-	//   uint32 Count, uint16 TokenCount,
-	//   uint16 paramWordCount + []uint64 LE,
-	//   uint16 tokenCount + (uint32 len + bytes) per token
-	templates []drain3.Template
-	// serialized: parallel to templates — per template with params:
-	//   uint16 nCols, then per col: uint32 dictSize + uint32 idxCount
-	// dict strings: uint32 total + uint32 LE lengths + raw bytes
-	// indices: uint32 total + uint32 LE values (flat block)
-	argCols []*templateArgs // len == len(templates), nil for templates with no params
-	// serialized: uint32 count + uint32 LE lengths + raw bytes
-	unmatched []string
+	templates   []drain3.Template
+	argCols     []*templateArgs
+	unmatched   []string
 
-	// --- NOT serialized (reconstructed or transient) ---
-
-	rowIdx   []uint32 // reconstructed from templateIDs
-	reconBuf []byte   // reusable scratch; not safe for concurrent use
-	argBuf   []string // reusable scratch; not safe for concurrent use
+	// --- NOT serialized ---
+	rowIdx   []uint32
+	reconBuf []byte
+	argBuf   []string
 }
 
 func (c *compressed) buildColumnArgs(rawArgs [][]string) {
@@ -306,6 +283,7 @@ func (c *compressed) decompressAll() []string {
 
 const compressMagic = "dc01"
 
+// stickyWriter provides writes with sticky errors and byte counting.
 type stickyWriter struct {
 	bw      *bufio.Writer
 	n       int64
@@ -331,11 +309,6 @@ func (sw *stickyWriter) writeString(s string) {
 	sw.err = err
 }
 
-func (sw *stickyWriter) u16(v uint16) {
-	binary.LittleEndian.PutUint16(sw.scratch[:2], v)
-	sw.write(sw.scratch[:2])
-}
-
 func (sw *stickyWriter) u32(v uint32) {
 	binary.LittleEndian.PutUint32(sw.scratch[:4], v)
 	sw.write(sw.scratch[:4])
@@ -346,6 +319,12 @@ func (sw *stickyWriter) u64(v uint64) {
 	sw.write(sw.scratch[:8])
 }
 
+// writeBlob writes a uint32 length prefix followed by raw bytes.
+func (sw *stickyWriter) writeBlob(b []byte) {
+	sw.u32(uint32(len(b)))
+	sw.write(b)
+}
+
 func (sw *stickyWriter) flush() {
 	if sw.err != nil {
 		return
@@ -353,8 +332,25 @@ func (sw *stickyWriter) flush() {
 	sw.err = sw.bw.Flush()
 }
 
-// WriteTo serializes using a type-separated, fixed-width layout
-// optimized for zstd.
+// uint16s → uint32s for streamvbyte encoding.
+func u16toU32(src []uint16) []uint32 {
+	dst := make([]uint32, len(src))
+	for i, v := range src {
+		dst[i] = uint32(v)
+	}
+	return dst
+}
+
+// svbEncode encodes a uint32 slice with streamvbyte, returns the blob.
+func svbEncode(vals []uint32) []byte {
+	if len(vals) == 0 {
+		return nil
+	}
+	return streamvbyte.EncodeUint32(vals, nil)
+}
+
+// WriteTo serializes using a type-separated layout with streamvbyte-encoded
+// integer arrays and raw string bytes, optimized for zstd.
 func (c *compressed) WriteTo(w io.Writer) (int64, error) {
 	sw := &stickyWriter{bw: bufio.NewWriter(w)}
 
@@ -370,46 +366,35 @@ func (c *compressed) WriteTo(w io.Writer) (int64, error) {
 		sw.u64(word)
 	}
 
-	// TemplateIDs — uint16 LE dense indices.
+	// TemplateIDs — streamvbyte.
 	sw.u32(uint32(len(c.templateIDs)))
-	for _, id := range c.templateIDs {
-		sw.u16(id)
-	}
+	sw.writeBlob(svbEncode(u16toU32(c.templateIDs)))
 
-	// Flat column indices — uint32 LE.
-	totalIndices := uint32(0)
+	// Flat column indices — streamvbyte.
+	var flatIdx []uint32
 	for _, ta := range c.argCols {
 		if ta == nil {
 			continue
 		}
 		for col := range ta.indices {
-			totalIndices += uint32(len(ta.indices[col]))
+			flatIdx = append(flatIdx, ta.indices[col]...)
 		}
 	}
-	sw.u32(totalIndices)
-	for _, ta := range c.argCols {
-		if ta == nil {
-			continue
-		}
-		for col := range ta.indices {
-			for _, idx := range ta.indices[col] {
-				sw.u32(idx)
-			}
-		}
-	}
+	sw.u32(uint32(len(flatIdx)))
+	sw.writeBlob(svbEncode(flatIdx))
 
 	// === TEMPLATES ===
 
-	sw.u16(uint16(len(c.templates)))
+	sw.u32(uint32(len(c.templates)))
 	for _, t := range c.templates {
 		sw.u32(uint32(t.Count))
-		sw.u16(uint16(t.TokenCount))
+		sw.u32(uint32(t.TokenCount))
 		pw := t.Params.Words()
-		sw.u16(uint16(len(pw)))
+		sw.u32(uint32(len(pw)))
 		for _, w := range pw {
 			sw.u64(w)
 		}
-		sw.u16(uint16(len(t.Tokens)))
+		sw.u32(uint32(len(t.Tokens)))
 		for _, tok := range t.Tokens {
 			sw.u32(uint32(len(tok)))
 			sw.writeString(tok)
@@ -417,43 +402,34 @@ func (c *compressed) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	// === COLUMN STRUCTURE ===
-	// Per template (in order): nCols, then per col: dictSize + idxCount.
-	// Templates with no params write nCols=0.
 
 	for _, ta := range c.argCols {
 		if ta == nil {
-			sw.u16(0)
+			sw.u32(0)
 			continue
 		}
-		sw.u16(uint16(len(ta.dicts)))
+		sw.u32(uint32(len(ta.dicts)))
 		for col := range ta.dicts {
 			sw.u32(uint32(len(ta.dicts[col])))
 			sw.u32(uint32(len(ta.indices[col])))
 		}
 	}
 
-	// === STRINGS: dict entries (lengths then bytes) ===
+	// === STRINGS: dict entries (streamvbyte lengths + raw bytes) ===
 
-	totalDE := uint32(0)
-	for _, ta := range c.argCols {
-		if ta == nil {
-			continue
-		}
-		for col := range ta.dicts {
-			totalDE += uint32(len(ta.dicts[col]))
-		}
-	}
-	sw.u32(totalDE)
+	var dictLens []uint32
 	for _, ta := range c.argCols {
 		if ta == nil {
 			continue
 		}
 		for col := range ta.dicts {
 			for _, s := range ta.dicts[col] {
-				sw.u32(uint32(len(s)))
+				dictLens = append(dictLens, uint32(len(s)))
 			}
 		}
 	}
+	sw.u32(uint32(len(dictLens)))
+	sw.writeBlob(svbEncode(dictLens))
 	for _, ta := range c.argCols {
 		if ta == nil {
 			continue
@@ -465,12 +441,14 @@ func (c *compressed) WriteTo(w io.Writer) (int64, error) {
 		}
 	}
 
-	// === STRINGS: unmatched (lengths then bytes) ===
+	// === STRINGS: unmatched (streamvbyte lengths + raw bytes) ===
 
-	sw.u32(uint32(len(c.unmatched)))
-	for _, s := range c.unmatched {
-		sw.u32(uint32(len(s)))
+	unmLens := make([]uint32, len(c.unmatched))
+	for i, s := range c.unmatched {
+		unmLens[i] = uint32(len(s))
 	}
+	sw.u32(uint32(len(unmLens)))
+	sw.writeBlob(svbEncode(unmLens))
 	for _, s := range c.unmatched {
 		sw.writeString(s)
 	}
@@ -501,35 +479,36 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 	}
 	bm := bitset.From(words)
 
-	// TemplateIDs.
-	matchCount := rd.u32()
-	templateIDs := make([]uint16, matchCount)
-	for i := range templateIDs {
-		templateIDs[i] = rd.u16()
+	// TemplateIDs — streamvbyte.
+	tmplIDCount := rd.u32()
+	tmplIDBlob := rd.blob()
+	tmplIDsU32 := svbDecode(tmplIDBlob, int(tmplIDCount))
+	templateIDs := make([]uint16, tmplIDCount)
+	for i, v := range tmplIDsU32 {
+		templateIDs[i] = uint16(v)
 	}
 
-	// Flat indices.
-	totalIdx := rd.u32()
-	flatIndices := make([]uint32, totalIdx)
-	for i := range flatIndices {
-		flatIndices[i] = rd.u32()
-	}
+	// Flat indices — streamvbyte.
+	flatIdxCount := rd.u32()
+	flatIdxBlob := rd.blob()
+	flatIndices := svbDecode(flatIdxBlob, int(flatIdxCount))
 
 	// Templates.
-	tmplCount := rd.u16()
+	tmplCount := rd.u32()
 	templates := make([]drain3.Template, tmplCount)
 	for i := range templates {
 		count := rd.u32()
-		tokenCount := rd.u16()
-		pwCount := rd.u16()
+		tokenCount := rd.u32()
+		pwCount := rd.u32()
 		pwords := make([]uint64, pwCount)
 		for j := range pwords {
 			pwords[j] = rd.u64()
 		}
-		nToks := rd.u16()
+		nToks := rd.u32()
 		tokens := make([]string, nToks)
 		for j := range tokens {
-			tokens[j] = rd.str()
+			n := rd.u32()
+			tokens[j] = rd.strN(int(n))
 		}
 		templates[i] = drain3.Template{
 			ID: i, Count: int(count), TokenCount: int(tokenCount),
@@ -537,12 +516,7 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 		}
 	}
 
-	// Column structure + reconstruct argCols.
-	argCols := make([]*templateArgs, tmplCount)
-	dictOff := 0
-	idxOff := 0
-
-	// First pass: read structure to know sizes.
+	// Column structure.
 	type colMeta struct {
 		nCols     int
 		dictSizes []uint32
@@ -550,7 +524,7 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 	}
 	metas := make([]colMeta, tmplCount)
 	for i := range metas {
-		nCols := rd.u16()
+		nCols := rd.u32()
 		m := colMeta{nCols: int(nCols), dictSizes: make([]uint32, nCols), idxCounts: make([]uint32, nCols)}
 		for col := range nCols {
 			m.dictSizes[col] = rd.u32()
@@ -559,18 +533,19 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 		metas[i] = m
 	}
 
-	// Dict strings.
-	totalDE := rd.u32()
-	dictLens := make([]uint32, totalDE)
-	for i := range dictLens {
-		dictLens[i] = rd.u32()
-	}
-	dictStrs := make([]string, totalDE)
+	// Dict strings — streamvbyte lengths + raw bytes.
+	dictCount := rd.u32()
+	dictLenBlob := rd.blob()
+	dictLens := svbDecode(dictLenBlob, int(dictCount))
+	dictStrs := make([]string, dictCount)
 	for i := range dictStrs {
 		dictStrs[i] = rd.strN(int(dictLens[i]))
 	}
 
-	// Assemble argCols.
+	// Reconstruct argCols.
+	argCols := make([]*templateArgs, tmplCount)
+	dictOff := 0
+	idxOff := 0
 	for i, m := range metas {
 		if m.nCols == 0 {
 			continue
@@ -588,12 +563,10 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 		argCols[i] = ta
 	}
 
-	// Unmatched strings.
+	// Unmatched — streamvbyte lengths + raw bytes.
 	unmCount := rd.u32()
-	unmLens := make([]uint32, unmCount)
-	for i := range unmLens {
-		unmLens[i] = rd.u32()
-	}
+	unmLenBlob := rd.blob()
+	unmLens := svbDecode(unmLenBlob, int(unmCount))
 	unmatched := make([]string, unmCount)
 	for i := range unmatched {
 		unmatched[i] = rd.strN(int(unmLens[i]))
@@ -648,6 +621,15 @@ func (c *compressed) reconstruct(tmpl drain3.Template, args []string) string {
 	return string(c.reconBuf)
 }
 
+// svbDecode decodes a streamvbyte-encoded blob into count uint32 values.
+func svbDecode(blob []byte, count int) []uint32 {
+	if count == 0 {
+		return nil
+	}
+	return streamvbyte.DecodeUint32(blob, count, nil)
+}
+
+// reader reads fixed-width LE values and blobs from a byte slice.
 type reader struct {
 	data []byte
 	pos  int
@@ -667,14 +649,6 @@ func (r *reader) need(n int) []byte {
 	return b
 }
 
-func (r *reader) u16() uint16 {
-	b := r.need(2)
-	if b == nil {
-		return 0
-	}
-	return binary.LittleEndian.Uint16(b)
-}
-
 func (r *reader) u32() uint32 {
 	b := r.need(4)
 	if b == nil {
@@ -691,9 +665,12 @@ func (r *reader) u64() uint64 {
 	return binary.LittleEndian.Uint64(b)
 }
 
-func (r *reader) str() string {
+func (r *reader) blob() []byte {
 	n := r.u32()
-	return r.strN(int(n))
+	if n == 0 {
+		return nil
+	}
+	return r.need(int(n))
 }
 
 func (r *reader) strN(n int) string {
