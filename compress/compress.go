@@ -1,11 +1,12 @@
 package compress
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"strings"
+	"slices"
 
 	"github.com/axiomhq/drain3"
 	"github.com/bits-and-blooms/bitset"
@@ -15,64 +16,231 @@ import (
 type DrainCompressed interface {
 	ValueAt(i int) string
 	WriteTo(w io.Writer) (int64, error)
+	Len() int
 }
 
-// Compress trains a drain3 matcher on lines and returns a DrainCompressed.
+// Decompress reconstructs all original lines from a DrainCompressed.
+func Decompress(dc DrainCompressed) []string {
+	if c, ok := dc.(*compressed); ok {
+		return c.decompressAll()
+	}
+	n := dc.Len()
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = dc.ValueAt(i)
+	}
+	return lines
+}
+
+// Compress trains a drain3 matcher on a stride-sampled 10% of lines and
+// compresses all lines using the trained matcher.
 func Compress(lines []string) (DrainCompressed, error) {
 	return CompressWithConfig(lines, drain3.DefaultConfig())
 }
 
 // CompressWithConfig is like Compress but with a custom drain3 config.
 func CompressWithConfig(lines []string, cfg drain3.Config) (DrainCompressed, error) {
-	matcher, err := drain3.TrainWithConfig(lines, cfg)
+	sample := strideSample(lines, 0.10, 64)
+	matcher, err := drain3.TrainWithConfig(sample, cfg)
 	if err != nil {
 		return nil, err
 	}
 	return CompressWithMatcher(lines, matcher)
 }
 
+// strideSample takes non-overlapping blocks of blockSize lines, evenly spaced,
+// covering approximately frac of the total lines.
+func strideSample(lines []string, frac float64, blockSize int) []string {
+	total := len(lines)
+	sampleN := int(float64(total) * frac)
+	if sampleN <= 0 || total == 0 {
+		return lines
+	}
+	numBlocks := max(sampleN/blockSize, 1)
+	stride := total / numBlocks
+	if stride < blockSize {
+		stride = blockSize
+	}
+	out := make([]string, 0, sampleN)
+	for start := 0; start < total && len(out) < sampleN; start += stride {
+		end := min(start+blockSize, total)
+		out = append(out, lines[start:end]...)
+	}
+	return out
+}
+
 // CompressWithMatcher compresses lines using a pre-trained matcher.
+// Templates matching fewer than 2 lines are demoted to unmatched.
 func CompressWithMatcher(lines []string, matcher *drain3.Matcher) (DrainCompressed, error) {
-	c := &compressed{
-		templates:   matcher.Templates(),
-		lineCount:   len(lines),
-		bitmap:      bitset.New(uint(len(lines))),
-		templateIDs: make([]int, 0, len(lines)),
-		args:        make([][]string, 0, len(lines)),
+	templates := matcher.Templates()
+	tmplByID := make(map[int]drain3.Template, len(templates))
+	for _, t := range templates {
+		tmplByID[t.ID] = t
 	}
 
-	// Build template lookup for ValueAt.
-	c.tmplByID = make(map[int]drain3.Template, len(c.templates))
-	for _, t := range c.templates {
-		c.tmplByID[t.ID] = t
-	}
-
+	// First pass: match all lines.
+	bitmap := bitset.New(uint(len(lines)))
+	templateIDs := make([]int, 0, len(lines))
+	rawArgs := make([][]string, 0, len(lines))
+	var unmatched []string
 	var buf [32]string
 	for i, line := range lines {
 		templateID, args, ok := matcher.MatchInto(line, buf[:0])
 		if !ok {
-			c.unmatched = append(c.unmatched, line)
+			unmatched = append(unmatched, line)
 			continue
 		}
-		c.bitmap.Set(uint(i))
-		c.templateIDs = append(c.templateIDs, templateID)
-		c.args = append(c.args, append([]string(nil), args...))
+		bitmap.Set(uint(i))
+		templateIDs = append(templateIDs, templateID)
+		rawArgs = append(rawArgs, append([]string(nil), args...))
 	}
 
+	// Demote templates with < 2 matches to unmatched.
+	tmplMatchCount := make(map[int]int, len(tmplByID))
+	for _, id := range templateIDs {
+		tmplMatchCount[id]++
+	}
+
+	newBitmap := bitset.New(uint(len(lines)))
+	var newTemplateIDs []int
+	var newRawArgs [][]string
+	var newUnmatched []string
+	matchIdx := 0
+	unmatchIdx := 0
+	for i := range len(lines) {
+		if bitmap.Test(uint(i)) {
+			id := templateIDs[matchIdx]
+			if tmplMatchCount[id] >= 2 {
+				newBitmap.Set(uint(i))
+				newTemplateIDs = append(newTemplateIDs, id)
+				newRawArgs = append(newRawArgs, rawArgs[matchIdx])
+			} else {
+				newUnmatched = append(newUnmatched, lines[i])
+			}
+			matchIdx++
+		} else {
+			newUnmatched = append(newUnmatched, unmatched[unmatchIdx])
+			unmatchIdx++
+		}
+	}
+
+	// Remove demoted templates.
+	activeTmpls := make(map[int]drain3.Template)
+	for _, id := range newTemplateIDs {
+		if _, ok := activeTmpls[id]; !ok {
+			activeTmpls[id] = tmplByID[id]
+		}
+	}
+
+	c := &compressed{
+		tmplByID:    activeTmpls,
+		lineCount:   len(lines),
+		bitmap:      newBitmap,
+		templateIDs: newTemplateIDs,
+		unmatched:   newUnmatched,
+	}
+	c.buildColumnArgs(newRawArgs)
 	return c, nil
 }
 
+// templateArgs holds dictionary-encoded columnar arg storage for one template.
+type templateArgs struct {
+	dicts   [][]string // dicts[col] = unique string values for this column
+	indices [][]int    // indices[col][row] = index into dicts[col]
+}
+
 type compressed struct {
-	templates   []drain3.Template
 	tmplByID    map[int]drain3.Template
 	lineCount   int
 	bitmap      *bitset.BitSet
 	templateIDs []int
-	args        [][]string
+	argCols     map[int]*templateArgs
+	rowIdx      []int
 	unmatched   []string
+	reconBuf    []byte   // reusable; not safe for concurrent use
+	argBuf      []string // reusable; not safe for concurrent use
 }
 
-// ValueAt reconstructs the string at position i. Panics if i is out of range.
+// buildColumnArgs converts row-based rawArgs into dictionary-encoded columnar storage.
+func (c *compressed) buildColumnArgs(rawArgs [][]string) {
+	c.rowIdx = make([]int, len(c.templateIDs))
+	tmplRowCount := make(map[int]int, len(c.tmplByID))
+	for matchIdx, id := range c.templateIDs {
+		c.rowIdx[matchIdx] = tmplRowCount[id]
+		tmplRowCount[id]++
+	}
+
+	type dictBuilder struct {
+		lookup map[string]int
+		values []string
+	}
+
+	c.argCols = make(map[int]*templateArgs, len(tmplRowCount))
+	builders := make(map[int][]dictBuilder, len(tmplRowCount))
+
+	for id, rowCount := range tmplRowCount {
+		nCols := int(c.tmplByID[id].Params.Count())
+		if nCols == 0 {
+			continue
+		}
+		ta := &templateArgs{
+			dicts:   make([][]string, nCols),
+			indices: make([][]int, nCols),
+		}
+		for col := range nCols {
+			ta.indices[col] = make([]int, rowCount)
+		}
+		c.argCols[id] = ta
+
+		bs := make([]dictBuilder, nCols)
+		for i := range bs {
+			bs[i].lookup = make(map[string]int)
+		}
+		builders[id] = bs
+	}
+
+	for matchIdx, id := range c.templateIDs {
+		bs := builders[id]
+		if bs == nil {
+			continue
+		}
+		row := c.rowIdx[matchIdx]
+		ta := c.argCols[id]
+		for col, val := range rawArgs[matchIdx] {
+			idx, ok := bs[col].lookup[val]
+			if !ok {
+				idx = len(bs[col].values)
+				bs[col].lookup[val] = idx
+				bs[col].values = append(bs[col].values, val)
+			}
+			ta.indices[col][row] = idx
+		}
+	}
+
+	for id, bs := range builders {
+		ta := c.argCols[id]
+		for col := range bs {
+			ta.dicts[col] = bs[col].values
+		}
+	}
+}
+
+// Len returns the number of lines.
+func (c *compressed) Len() int { return c.lineCount }
+
+func (c *compressed) gatherArgs(id int, row int) []string {
+	ta := c.argCols[id]
+	if ta == nil {
+		return c.argBuf[:0]
+	}
+	c.argBuf = c.argBuf[:0]
+	for col := range ta.dicts {
+		c.argBuf = append(c.argBuf, ta.dicts[col][ta.indices[col][row]])
+	}
+	return c.argBuf
+}
+
+// ValueAt reconstructs the string at position i. Panics if out of range.
 func (c *compressed) ValueAt(i int) string {
 	if i < 0 || i >= c.lineCount {
 		panic(fmt.Sprintf("compress: index %d out of range [0, %d)", i, c.lineCount))
@@ -80,76 +248,164 @@ func (c *compressed) ValueAt(i int) string {
 	ui := uint(i)
 	if c.bitmap.Test(ui) {
 		matchIdx := int(c.bitmap.Rank(ui)) - 1
-		tmpl := c.tmplByID[c.templateIDs[matchIdx]]
-		return reconstruct(tmpl, c.args[matchIdx])
+		id := c.templateIDs[matchIdx]
+		tmpl := c.tmplByID[id]
+		args := c.gatherArgs(id, c.rowIdx[matchIdx])
+		return c.reconstruct(tmpl, args)
 	}
 	unmatchIdx := i - int(c.bitmap.Rank(ui))
 	return c.unmatched[unmatchIdx]
 }
 
-const (
-	compressMagic   = "dc01"
-	compressVersion = byte(1)
-)
+// decompressAll reconstructs all lines via a linear bitmap walk.
+func (c *compressed) decompressAll() []string {
+	lines := make([]string, c.lineCount)
+	matchIdx := 0
+	unmatchIdx := 0
+	for i := range c.lineCount {
+		if c.bitmap.Test(uint(i)) {
+			id := c.templateIDs[matchIdx]
+			tmpl := c.tmplByID[id]
+			args := c.gatherArgs(id, c.rowIdx[matchIdx])
+			lines[i] = c.reconstruct(tmpl, args)
+			matchIdx++
+		} else {
+			lines[i] = c.unmatched[unmatchIdx]
+			unmatchIdx++
+		}
+	}
+	return lines
+}
 
-// WriteTo serializes the compressed representation to w.
+const compressMagic = "dc01"
+
+// countWriter wraps a buffered writer with byte counting and sticky errors.
+type countWriter struct {
+	bw      *bufio.Writer
+	n       int64
+	err     error
+	scratch [binary.MaxVarintLen64]byte
+}
+
+func (cw *countWriter) write(p []byte) {
+	if cw.err != nil {
+		return
+	}
+	n, err := cw.bw.Write(p)
+	cw.n += int64(n)
+	cw.err = err
+}
+
+func (cw *countWriter) writeString(s string) {
+	if cw.err != nil {
+		return
+	}
+	n, err := cw.bw.WriteString(s)
+	cw.n += int64(n)
+	cw.err = err
+}
+
+func (cw *countWriter) flush() {
+	if cw.err != nil {
+		return
+	}
+	cw.err = cw.bw.Flush()
+}
+
+// WriteTo serializes the compressed representation.
+// The output is designed to be maximally compressible by zstd.
 func (c *compressed) WriteTo(w io.Writer) (int64, error) {
-	var buf bytes.Buffer
+	cw := &countWriter{bw: bufio.NewWriter(w)}
 
-	buf.WriteString(compressMagic)
-	buf.WriteByte(compressVersion)
-
-	writeUvarint(&buf, uint64(c.lineCount))
+	// Header.
+	copy(cw.scratch[:4], compressMagic)
+	cw.write(cw.scratch[:4])
+	writeUvarint(cw, uint64(c.lineCount))
 
 	// Bitmap.
 	words := c.bitmap.Words()
-	writeUvarint(&buf, uint64(len(words)))
+	writeUvarint(cw, uint64(len(words)))
 	for _, word := range words {
-		binary.Write(&buf, binary.LittleEndian, word)
+		binary.LittleEndian.PutUint64(cw.scratch[:8], word)
+		cw.write(cw.scratch[:8])
 	}
 
-	// Templates.
-	writeUvarint(&buf, uint64(len(c.templates)))
-	for _, t := range c.templates {
-		writeVarint(&buf, int64(t.ID))
-		writeVarint(&buf, int64(t.Count))
-		writeUvarint(&buf, uint64(t.TokenCount))
+	// Templates sorted by ID.
+	tmplIDs := make([]int, 0, len(c.tmplByID))
+	for id := range c.tmplByID {
+		tmplIDs = append(tmplIDs, id)
+	}
+	slices.Sort(tmplIDs)
+
+	writeUvarint(cw, uint64(len(tmplIDs)))
+	for _, id := range tmplIDs {
+		t := c.tmplByID[id]
+		writeVarint(cw, int64(t.ID))
+		writeVarint(cw, int64(t.Count))
+		writeUvarint(cw, uint64(t.TokenCount))
 
 		paramWords := t.Params.Words()
-		writeUvarint(&buf, uint64(len(paramWords)))
+		writeUvarint(cw, uint64(len(paramWords)))
 		for _, pw := range paramWords {
-			binary.Write(&buf, binary.LittleEndian, pw)
+			binary.LittleEndian.PutUint64(cw.scratch[:8], pw)
+			cw.write(cw.scratch[:8])
 		}
 
-		writeUvarint(&buf, uint64(len(t.Tokens)))
+		writeUvarint(cw, uint64(len(t.Tokens)))
 		for _, tok := range t.Tokens {
-			writeString(&buf, tok)
+			writeString(cw, tok)
 		}
 	}
 
 	// TemplateIDs.
-	writeUvarint(&buf, uint64(len(c.templateIDs)))
+	writeUvarint(cw, uint64(len(c.templateIDs)))
 	for _, id := range c.templateIDs {
-		writeVarint(&buf, int64(id))
+		writeVarint(cw, int64(id))
 	}
 
-	// Args.
-	writeUvarint(&buf, uint64(len(c.args)))
-	for _, args := range c.args {
-		writeUvarint(&buf, uint64(len(args)))
-		for _, a := range args {
-			writeString(&buf, a)
+	// Columnar args.
+	var argColIDs []int
+	for _, id := range tmplIDs {
+		if _, ok := c.argCols[id]; ok {
+			argColIDs = append(argColIDs, id)
+		}
+	}
+	writeUvarint(cw, uint64(len(argColIDs)))
+	for _, id := range argColIDs {
+		ta := c.argCols[id]
+		writeVarint(cw, int64(id))
+		writeUvarint(cw, uint64(len(ta.dicts)))
+		for col := range ta.dicts {
+			writeUvarint(cw, uint64(len(ta.dicts[col])))
+			for _, s := range ta.dicts[col] {
+				writeString(cw, s)
+			}
+			writeUvarint(cw, uint64(len(ta.indices[col])))
+			for _, idx := range ta.indices[col] {
+				writeUvarint(cw, uint64(idx))
+			}
 		}
 	}
 
 	// Unmatched.
-	writeUvarint(&buf, uint64(len(c.unmatched)))
+	writeUvarint(cw, uint64(len(c.unmatched)))
 	for _, s := range c.unmatched {
-		writeString(&buf, s)
+		writeString(cw, s)
 	}
 
-	n, err := buf.WriteTo(w)
-	return n, err
+	cw.flush()
+	return cw.n, cw.err
+}
+
+func safeReadUvarint(br *bytes.Reader, label string) (uint64, error) {
+	count, err := readUvarint(br)
+	if err != nil {
+		return 0, fmt.Errorf("compress: read %s: %w", label, err)
+	}
+	if count > uint64(br.Len()) {
+		return 0, fmt.Errorf("compress: %s count %d exceeds remaining bytes %d", label, count, br.Len())
+	}
+	return count, nil
 }
 
 // ReadFrom deserializes a DrainCompressed from r.
@@ -167,13 +423,6 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 	if string(magic) != compressMagic {
 		return nil, fmt.Errorf("compress: invalid magic %q", magic)
 	}
-	ver, err := br.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("compress: read version: %w", err)
-	}
-	if ver != compressVersion {
-		return nil, fmt.Errorf("compress: unsupported version %d", ver)
-	}
 
 	lineCount, err := readUvarint(br)
 	if err != nil {
@@ -181,9 +430,9 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 	}
 
 	// Bitmap.
-	wordCount, err := readUvarint(br)
+	wordCount, err := safeReadUvarint(br, "bitmap word count")
 	if err != nil {
-		return nil, fmt.Errorf("compress: read bitmap word count: %w", err)
+		return nil, err
 	}
 	words := make([]uint64, wordCount)
 	for j := range words {
@@ -194,12 +443,12 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 	bm := bitset.From(words)
 
 	// Templates.
-	tmplCount, err := readUvarint(br)
+	tmplCount, err := safeReadUvarint(br, "template count")
 	if err != nil {
-		return nil, fmt.Errorf("compress: read template count: %w", err)
+		return nil, err
 	}
-	templates := make([]drain3.Template, tmplCount)
-	for i := range templates {
+	tmplByID := make(map[int]drain3.Template, tmplCount)
+	for range tmplCount {
 		id, err := readVarint(br)
 		if err != nil {
 			return nil, fmt.Errorf("compress: read template id: %w", err)
@@ -213,9 +462,9 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 			return nil, fmt.Errorf("compress: read token count: %w", err)
 		}
 
-		pwCount, err := readUvarint(br)
+		pwCount, err := safeReadUvarint(br, "param word count")
 		if err != nil {
-			return nil, fmt.Errorf("compress: read param word count: %w", err)
+			return nil, err
 		}
 		pwords := make([]uint64, pwCount)
 		for j := range pwords {
@@ -224,19 +473,19 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 			}
 		}
 
-		denseCount, err := readUvarint(br)
+		denseCount, err := safeReadUvarint(br, "dense token count")
 		if err != nil {
-			return nil, fmt.Errorf("compress: read dense token count: %w", err)
+			return nil, err
 		}
 		tokens := make([]string, denseCount)
 		for j := range tokens {
-			tokens[j], err = readString(br)
+			tokens[j], err = readStringDirect(br, data)
 			if err != nil {
 				return nil, fmt.Errorf("compress: read token: %w", err)
 			}
 		}
 
-		templates[i] = drain3.Template{
+		tmplByID[int(id)] = drain3.Template{
 			ID:         int(id),
 			Tokens:     tokens,
 			Params:     bitset.From(pwords),
@@ -246,9 +495,9 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 	}
 
 	// TemplateIDs.
-	matchCount, err := readUvarint(br)
+	matchCount, err := safeReadUvarint(br, "match count")
 	if err != nil {
-		return nil, fmt.Errorf("compress: read match count: %w", err)
+		return nil, err
 	}
 	templateIDs := make([]int, matchCount)
 	for i := range templateIDs {
@@ -259,91 +508,159 @@ func ReadFrom(r io.Reader) (DrainCompressed, error) {
 		templateIDs[i] = int(v)
 	}
 
-	// Args.
-	argsCount, err := readUvarint(br)
+	// Columnar args.
+	argColCount, err := safeReadUvarint(br, "arg columns count")
 	if err != nil {
-		return nil, fmt.Errorf("compress: read args count: %w", err)
+		return nil, err
 	}
-	args := make([][]string, argsCount)
-	for i := range args {
-		n, err := readUvarint(br)
+	argCols := make(map[int]*templateArgs, argColCount)
+	for range argColCount {
+		id, err := readVarint(br)
 		if err != nil {
-			return nil, fmt.Errorf("compress: read arg count: %w", err)
+			return nil, fmt.Errorf("compress: read arg template id: %w", err)
 		}
-		args[i] = make([]string, n)
-		for j := range args[i] {
-			args[i][j], err = readString(br)
+		nCols, err := safeReadUvarint(br, "column count")
+		if err != nil {
+			return nil, err
+		}
+		ta := &templateArgs{
+			dicts:   make([][]string, nCols),
+			indices: make([][]int, nCols),
+		}
+		for col := range nCols {
+			dictSize, err := safeReadUvarint(br, "dict size")
 			if err != nil {
-				return nil, fmt.Errorf("compress: read arg: %w", err)
+				return nil, err
+			}
+			ta.dicts[col] = make([]string, dictSize)
+			for j := range dictSize {
+				ta.dicts[col][j], err = readStringDirect(br, data)
+				if err != nil {
+					return nil, fmt.Errorf("compress: read dict entry: %w", err)
+				}
+			}
+			numIndices, err := safeReadUvarint(br, "indices count")
+			if err != nil {
+				return nil, err
+			}
+			ta.indices[col] = make([]int, numIndices)
+			for j := range numIndices {
+				v, err := readUvarint(br)
+				if err != nil {
+					return nil, fmt.Errorf("compress: read index: %w", err)
+				}
+				ta.indices[col][j] = int(v)
 			}
 		}
+		argCols[int(id)] = ta
 	}
 
 	// Unmatched.
-	unmatchedCount, err := readUvarint(br)
+	unmatchedCount, err := safeReadUvarint(br, "unmatched count")
 	if err != nil {
-		return nil, fmt.Errorf("compress: read unmatched count: %w", err)
+		return nil, err
 	}
 	unmatched := make([]string, unmatchedCount)
 	for i := range unmatched {
-		unmatched[i], err = readString(br)
+		unmatched[i], err = readStringDirect(br, data)
 		if err != nil {
 			return nil, fmt.Errorf("compress: read unmatched: %w", err)
 		}
 	}
 
-	tmplByID := make(map[int]drain3.Template, len(templates))
-	for _, t := range templates {
-		tmplByID[t.ID] = t
+	if br.Len() != 0 {
+		return nil, fmt.Errorf("compress: %d unexpected trailing bytes", br.Len())
+	}
+
+	// Validate.
+	if len(templateIDs) != int(bm.Count()) {
+		return nil, fmt.Errorf("compress: templateIDs length %d does not match bitmap popcount %d", len(templateIDs), bm.Count())
+	}
+	for i, id := range templateIDs {
+		if _, ok := tmplByID[id]; !ok {
+			return nil, fmt.Errorf("compress: templateIDs[%d] references unknown template id %d", i, id)
+		}
+	}
+	tmplRowCount := make(map[int]int, len(argCols))
+	for _, id := range templateIDs {
+		tmplRowCount[id]++
+	}
+	for id, ta := range argCols {
+		expected := tmplRowCount[id]
+		for col := range ta.indices {
+			if len(ta.indices[col]) != expected {
+				return nil, fmt.Errorf("compress: template %d column %d has %d rows, expected %d", id, col, len(ta.indices[col]), expected)
+			}
+			for _, idx := range ta.indices[col] {
+				if idx < 0 || idx >= len(ta.dicts[col]) {
+					return nil, fmt.Errorf("compress: template %d column %d index %d out of range [0, %d)", id, col, idx, len(ta.dicts[col]))
+				}
+			}
+		}
+	}
+
+	// Reconstruct rowIdx.
+	rowIdx := make([]int, len(templateIDs))
+	clear(tmplRowCount)
+	for i, id := range templateIDs {
+		rowIdx[i] = tmplRowCount[id]
+		tmplRowCount[id]++
 	}
 
 	return &compressed{
-		templates:   templates,
 		tmplByID:    tmplByID,
 		lineCount:   int(lineCount),
 		bitmap:      bm,
 		templateIDs: templateIDs,
-		args:        args,
+		argCols:     argCols,
+		rowIdx:      rowIdx,
 		unmatched:   unmatched,
 	}, nil
 }
 
-func reconstruct(tmpl drain3.Template, args []string) string {
-	var b strings.Builder
+func (c *compressed) reconstruct(tmpl drain3.Template, args []string) string {
+	paramCount := int(tmpl.Params.Count())
+	if len(args) != paramCount {
+		panic(fmt.Sprintf("compress: reconstruct: template %d has %d params but got %d args", tmpl.ID, paramCount, len(args)))
+	}
+	denseCount := tmpl.TokenCount - paramCount
+	if len(tmpl.Tokens) != denseCount {
+		panic(fmt.Sprintf("compress: reconstruct: template %d expects %d dense tokens but has %d", tmpl.ID, denseCount, len(tmpl.Tokens)))
+	}
+
+	c.reconBuf = c.reconBuf[:0]
 	denseIdx := 0
 	argIdx := 0
 	for i := range tmpl.TokenCount {
 		if i > 0 {
-			b.WriteByte(' ')
+			c.reconBuf = append(c.reconBuf, ' ')
 		}
-		if tmpl.Params.Test(uint(i)) && argIdx < len(args) {
-			b.WriteString(args[argIdx])
+		if tmpl.Params.Test(uint(i)) {
+			c.reconBuf = append(c.reconBuf, args[argIdx]...)
 			argIdx++
 		} else {
-			b.WriteString(tmpl.Tokens[denseIdx])
+			c.reconBuf = append(c.reconBuf, tmpl.Tokens[denseIdx]...)
 			denseIdx++
 		}
 	}
-	return b.String()
+	return string(c.reconBuf)
 }
 
-// Binary encoding helpers.
+// Binary helpers.
 
-func writeUvarint(w *bytes.Buffer, v uint64) {
-	var scratch [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(scratch[:], v)
-	w.Write(scratch[:n])
+func writeUvarint(cw *countWriter, v uint64) {
+	n := binary.PutUvarint(cw.scratch[:], v)
+	cw.write(cw.scratch[:n])
 }
 
-func writeVarint(w *bytes.Buffer, v int64) {
-	var scratch [binary.MaxVarintLen64]byte
-	n := binary.PutVarint(scratch[:], v)
-	w.Write(scratch[:n])
+func writeVarint(cw *countWriter, v int64) {
+	n := binary.PutVarint(cw.scratch[:], v)
+	cw.write(cw.scratch[:n])
 }
 
-func writeString(w *bytes.Buffer, s string) {
-	writeUvarint(w, uint64(len(s)))
-	w.WriteString(s)
+func writeString(cw *countWriter, s string) {
+	writeUvarint(cw, uint64(len(s)))
+	cw.writeString(s)
 }
 
 func readUvarint(r *bytes.Reader) (uint64, error) {
@@ -354,17 +671,20 @@ func readVarint(r *bytes.Reader) (int64, error) {
 	return binary.ReadVarint(r)
 }
 
-func readString(r *bytes.Reader) (string, error) {
-	n, err := binary.ReadUvarint(r)
+func readStringDirect(br *bytes.Reader, data []byte) (string, error) {
+	n, err := binary.ReadUvarint(br)
 	if err != nil {
 		return "", err
 	}
-	if n > uint64(r.Len()) {
+	if n > uint64(br.Len()) {
 		return "", io.ErrUnexpectedEOF
 	}
-	buf := make([]byte, int(n))
-	if _, err := io.ReadFull(r, buf); err != nil {
+	if n == 0 {
+		return "", nil
+	}
+	start := len(data) - br.Len()
+	if _, err := br.Seek(int64(n), io.SeekCurrent); err != nil {
 		return "", err
 	}
-	return string(buf), nil
+	return string(data[start : start+int(n)]), nil
 }
