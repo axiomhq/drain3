@@ -1,0 +1,19 @@
+# Local corpus
+data.json
+
+# Build/test artifacts
+*.test
+*.out
+bin/
+dist/
+
+# Bench/profile artifacts
+benchmarks/
+*.bench
+*.prof
+*.pprof
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
