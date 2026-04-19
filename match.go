@@ -72,7 +72,7 @@ func (m *Matcher) findMatch(line string, tokenBuf []string) (cluster *cluster, t
 			if cap(candidateIDs) > cap(buf) {
 				m.scratchCandidates = candidateIDs[:0:cap(candidateIDs)]
 			}
-			return m.fastMatchStrings(candidateIDs, tokens, m.cfg.MatchThreshold, true), tokens
+			return m.fastMatchPrefiltered(candidateIDs, tokens, m.cfg.MatchThreshold), tokens
 		}
 		return nil, tokens
 	}
@@ -205,6 +205,84 @@ func (m *Matcher) fastMatch(clusterIDs []int, tokenIDs []uint64, simTh float64, 
 		}
 	}
 
+	if maxScore >= needed {
+		return maxCluster
+	}
+	return nil
+}
+
+// fastMatchPrefiltered is the match hot path for prefilter-selected candidates.
+// Prefilter buckets are keyed by token count, so every candidate's token count
+// equals len(tokens) — the per-candidate length check from fastMatchStrings is
+// therefore omitted.
+func (m *Matcher) fastMatchPrefiltered(clusterIDs []int, tokens []string, simTh float64) *cluster {
+	hot := m.clusterHot
+	clusters := m.clusters
+
+	if simTh >= 1.0 {
+	nextCandidate:
+		for _, id := range clusterIDs {
+			h := &hot[id]
+			str := h.tokenStr
+			if a := h.anchor0; a >= 0 && str[a] != tokens[a] {
+				continue
+			}
+			if a := h.anchor1; a >= 0 && str[a] != tokens[a] {
+				continue
+			}
+			for _, idx := range h.middleIdx {
+				if str[idx] != tokens[idx] {
+					continue nextCandidate
+				}
+			}
+			return clusters[id]
+		}
+		return nil
+	}
+
+	needed := m.requiredScore(len(tokens), simTh)
+	maxScore := -1
+	maxParamCount := int32(-1)
+	var maxCluster *cluster
+	for _, id := range clusterIDs {
+		h := &hot[id]
+		str := h.tokenStr
+		paramCount := h.paramCount
+		simTokens := int(paramCount)
+		remaining := int(h.npCount)
+		if a := h.anchor0; a >= 0 {
+			if str[a] == tokens[a] {
+				simTokens++
+			}
+			remaining--
+			if simTokens+remaining < needed {
+				continue
+			}
+		}
+		if a := h.anchor1; a >= 0 {
+			if str[a] == tokens[a] {
+				simTokens++
+			}
+			remaining--
+			if simTokens+remaining < needed {
+				continue
+			}
+		}
+		for _, idx := range h.middleIdx {
+			if str[idx] == tokens[idx] {
+				simTokens++
+			}
+			remaining--
+			if simTokens+remaining < needed {
+				break
+			}
+		}
+		if simTokens > maxScore || (simTokens == maxScore && paramCount > maxParamCount) {
+			maxScore = simTokens
+			maxParamCount = paramCount
+			maxCluster = clusters[id]
+		}
+	}
 	if maxScore >= needed {
 		return maxCluster
 	}

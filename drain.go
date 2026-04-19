@@ -39,6 +39,7 @@ type Matcher struct {
 	nextCluster      int                        // next cluster ID to assign
 	prefilterBuckets []prefilterBucket          // first/last-token prefilter index, keyed by token count
 	matchNeeded      []int                      // precomputed ceil(MatchThreshold * tokenCount), keyed by token count
+	clusterHot       []clusterHot               // parallel SoA cache of cluster fields used in the match hot path
 
 	hasParamFirst bool // true if any cluster has paramID at position 0
 
@@ -70,10 +71,25 @@ type cluster struct {
 	tokenIDs    []uint64
 	tokenStr    []string
 	nonParamIdx []uint16
+	// middleIdx is nonParamIdx with the anchor positions trimmed off, so the
+	// match inner loop doesn't re-compare tokens already checked by anchors.
+	middleIdx []uint16
 	// Anchor positions for cheap pre-rejection. -1 = no anchor.
 	// anchor0 is the first non-param position, anchor1 is the last.
 	anchor0 int
 	anchor1 int
+}
+
+// clusterHot packs the fields touched by the match hot path into a single
+// value-typed record, keyed by cluster ID. Replaces the pointer-chase
+// through []*cluster with a direct array load per candidate.
+type clusterHot struct {
+	tokenStr   []string
+	middleIdx  []uint16
+	anchor0    int32
+	anchor1    int32
+	paramCount int32
+	npCount    int32 // len(nonParamIdx)
 }
 
 func newCluster(id int, tokenStr []string, tokenIDs []uint64, size int, paramID uint64) *cluster {
@@ -95,12 +111,15 @@ func (c *cluster) buildNonParamIdx(paramID uint64) {
 	if len(c.nonParamIdx) >= 2 {
 		c.anchor0 = int(c.nonParamIdx[0])
 		c.anchor1 = int(c.nonParamIdx[len(c.nonParamIdx)-1])
+		c.middleIdx = c.nonParamIdx[1 : len(c.nonParamIdx)-1]
 	} else if len(c.nonParamIdx) == 1 {
 		c.anchor0 = int(c.nonParamIdx[0])
 		c.anchor1 = -1
+		c.middleIdx = nil
 	} else {
 		c.anchor0 = -1
 		c.anchor1 = -1
+		c.middleIdx = nil
 	}
 }
 
@@ -212,6 +231,25 @@ func (m *Matcher) freezeDict() {
 		if c != nil && len(c.tokenIDs) > 0 && c.tokenIDs[0] == m.paramID {
 			m.hasParamFirst = true
 			break
+		}
+	}
+	m.rebuildClusterHot()
+}
+
+func (m *Matcher) rebuildClusterHot() {
+	m.clusterHot = make([]clusterHot, len(m.clusters))
+	for id := 1; id < len(m.clusters); id++ {
+		c := m.clusters[id]
+		if c == nil {
+			continue
+		}
+		m.clusterHot[id] = clusterHot{
+			tokenStr:   c.tokenStr,
+			middleIdx:  c.middleIdx,
+			anchor0:    int32(c.anchor0),
+			anchor1:    int32(c.anchor1),
+			paramCount: int32(c.paramCount),
+			npCount:    int32(len(c.nonParamIdx)),
 		}
 	}
 }
