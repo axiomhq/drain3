@@ -70,6 +70,7 @@ type cluster struct {
 	tokenIDs    []uint64
 	tokenStr    []string
 	nonParamIdx []uint16
+	paramIdx    []uint16 // positions where tokenIDs[i] == paramID; complement of nonParamIdx
 	// Anchor positions for cheap pre-rejection. -1 = no anchor.
 	// anchor0 is the first non-param position, anchor1 is the last.
 	anchor0 int
@@ -84,9 +85,11 @@ func newCluster(id int, tokenStr []string, tokenIDs []uint64, size int, paramID 
 
 func (c *cluster) buildNonParamIdx(paramID uint64) {
 	c.nonParamIdx = c.nonParamIdx[:0]
+	c.paramIdx = c.paramIdx[:0]
 	c.paramCount = 0
 	for i, tid := range c.tokenIDs {
 		if tid == paramID {
+			c.paramIdx = append(c.paramIdx, uint16(i))
 			c.paramCount++
 		} else {
 			c.nonParamIdx = append(c.nonParamIdx, uint16(i))
@@ -108,19 +111,21 @@ func (c *cluster) rebuildNonParamIdx(paramID uint64) {
 	c.buildNonParamIdx(paramID)
 }
 
-func (c *cluster) extractArgsInto(lineTokens []string, paramID uint64, dst []string) []string {
-	if len(c.tokenIDs) == 0 || len(lineTokens) == 0 || c.paramCount == 0 {
+func (c *cluster) extractArgsInto(lineTokens []string, dst []string) []string {
+	if c.paramCount == 0 || len(lineTokens) == 0 {
 		return nil
 	}
-	limit := min(len(c.tokenIDs), len(lineTokens))
+	nLine := len(lineTokens)
 	args := dst[:0]
-	if cap(args) < min(c.paramCount, limit) {
+	if cap(args) < c.paramCount {
 		args = make([]string, 0, c.paramCount)
 	}
-	for i := 0; i < limit; i++ {
-		if c.tokenIDs[i] == paramID {
-			args = append(args, lineTokens[i])
+	for _, i := range c.paramIdx {
+		pos := int(i)
+		if pos >= nLine {
+			break
 		}
+		args = append(args, lineTokens[pos])
 	}
 	if len(args) == 0 {
 		return nil

@@ -28,7 +28,7 @@ func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []s
 	if cluster == nil {
 		return 0, nil, false
 	}
-	return cluster.id, cluster.extractArgsInto(tokens, m.paramID, dst), true
+	return cluster.id, cluster.extractArgsInto(tokens, dst), true
 }
 
 func (m *Matcher) findMatch(line string, tokenBuf []string) (cluster *cluster, tokens []string) {
