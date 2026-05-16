@@ -37,10 +37,11 @@ type Matcher struct {
 	dictNextID       uint64                     // next token ID to assign
 	paramID          uint64                     // numeric ID of cfg.ParamString
 	nextCluster      int                        // next cluster ID to assign
-	prefilterBuckets []prefilterBucket          // first/last-token prefilter index, keyed by token count
+	prefilterBuckets []prefilterBucket          // match prefilter indexes, keyed by token count
 	matchNeeded      []int                      // precomputed ceil(MatchThreshold * tokenCount), keyed by token count
 
 	hasParamFirst bool // true if any cluster has paramID at position 0
+	useIDScorer   bool // resolved from cfg.MatchScorer + template count at freeze
 
 	// Scratch buffers — reused across calls.
 	scratchIDs        []uint64
@@ -49,13 +50,40 @@ type Matcher struct {
 }
 
 type prefilterBucket struct {
-	any       []int
-	firstKeys []uint64
-	firstVals [][]int
-	lastKeys  []uint64
-	lastVals  [][]int
-	flKeys    []uint64
-	flVals    [][]int
+	// Normal Match prefilter groups candidates by first and/or last token.
+	any       []int    // templates whose first and last tokens are params
+	firstKeys []uint64 // sorted literal first-token IDs
+	firstVals [][]int  // candidate template IDs for firstKeys
+	lastKeys  []uint64 // sorted literal last-token IDs
+	lastVals  [][]int  // candidate template IDs for lastKeys
+	flKeys    []uint64 // sorted packed first/last-token ID pairs
+	flVals    [][]int  // candidate template IDs for flKeys
+	exactAny  []int    // exact-match templates with no literal anchor tokens
+
+	// Exact Match prefilter groups candidates by first/last non-param anchors.
+	anchorPos      []uint16        // positions with a single non-param anchor
+	anchorKeys     []anchorKey     // sorted single-anchor lookups
+	anchorVals     [][]int         // candidate template IDs for anchorKeys
+	anchorPairPos  []anchorPairPos // position pairs with two non-param anchors
+	anchorPairKeys []anchorPairKey // sorted two-anchor lookups
+	anchorPairVals [][]int         // candidate template IDs for anchorPairKeys
+}
+
+type anchorKey struct {
+	pos uint16
+	id  uint64
+}
+
+type anchorPairPos struct {
+	pos0 uint16
+	pos1 uint16
+}
+
+type anchorPairKey struct {
+	pos0 uint16
+	pos1 uint16
+	id0  uint64
+	id1  uint64
 }
 
 type node struct {
@@ -213,6 +241,17 @@ func (m *Matcher) freezeDict() {
 			m.hasParamFirst = true
 			break
 		}
+	}
+	// Resolve the prefilter scorer once. Auto picks ID for large
+	// dictionaries (candidate scans amortize the per-line token-ID
+	// resolution) and String for small ones (no regression).
+	switch m.cfg.MatchScorer {
+	case MatchScorerString:
+		m.useIDScorer = false
+	case MatchScorerID:
+		m.useIDScorer = true
+	default: // MatchScorerAuto
+		m.useIDScorer = len(m.templates) >= autoScorerTemplateThreshold
 	}
 }
 

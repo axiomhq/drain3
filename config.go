@@ -2,6 +2,25 @@ package drain3
 
 import "fmt"
 
+// MatchScorer selects how the prefilter path verifies candidate templates.
+type MatchScorer int
+
+const (
+	// MatchScorerAuto (zero value) picks String or ID at build time from
+	// the trained template count: small dictionaries use String (no
+	// regression), large ones use ID (the up-front token-ID resolution
+	// amortizes across the larger candidate scans). See autoScorerTemplateThreshold.
+	MatchScorerAuto MatchScorer = iota
+	// MatchScorerString compares candidate tokens as strings. No speedup,
+	// no regression on any workload. Best for small dictionaries or
+	// miss-dominated streams.
+	MatchScorerString
+	// MatchScorerID resolves line tokens to dictionary IDs once and
+	// compares uint64s. Large win for large-dictionary, hit-dominated
+	// streams; a modest penalty on misses.
+	MatchScorerID
+)
+
 // Config controls training and matching behavior.
 type Config struct {
 	Depth                    int
@@ -15,7 +34,15 @@ type Config struct {
 	ParametrizeNumericTokens bool
 	ExtraDelimiters          []string
 	EnableMatchPrefilter     bool
+	MatchScorer              MatchScorer // zero value = MatchScorerAuto
 }
+
+// autoScorerTemplateThreshold is the trained-template count at or above
+// which MatchScorerAuto resolves to MatchScorerID. Below it, ID's up-front
+// per-line token resolution does not amortize over the small candidate
+// scans, so String is used. Heuristic: small dictionaries (hundreds) favor
+// String; larger ones (≈thousands) favor ID by a wide margin.
+const autoScorerTemplateThreshold = 1024
 
 // DefaultConfig returns default Drain settings.
 func DefaultConfig() Config {
@@ -56,6 +83,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	if cfg.ParamString == "" {
 		return Config{}, fmt.Errorf("param string must not be empty")
+	}
+	if cfg.MatchScorer < MatchScorerAuto || cfg.MatchScorer > MatchScorerID {
+		return Config{}, fmt.Errorf("invalid match scorer %d", cfg.MatchScorer)
 	}
 
 	if len(cfg.ExtraDelimiters) > 0 {

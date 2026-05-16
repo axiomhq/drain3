@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/bits-and-blooms/bitset"
 )
 
 // renderTemplatePlaceholders expands a dense Template into its full
@@ -48,7 +50,7 @@ func TestLogpaiSSHDScenario(t *testing.T) {
 	}
 
 	want := map[string]int{
-		"Dec 10 <*> LabSZ <*> input_userauth_request: invalid user <*> [preauth]":             3,
+		"Dec 10 <*> LabSZ <*> input_userauth_request: invalid user <*> [preauth]":              3,
 		"Dec 10 <*> LabSZ <*> Failed password for invalid user <*> from 0.0.0.0 port <*> ssh2": 3,
 	}
 	got := map[string]int{}
@@ -124,6 +126,69 @@ func TestLogpaiShortMessage(t *testing.T) {
 	}
 }
 
+// TestMatchScorerEquivalence asserts the String and ID scorers return
+// byte-identical results (the dictionary-injective safety property), and
+// that MatchScorerAuto resolves from the trained template count.
+func TestMatchScorerEquivalence(t *testing.T) {
+	train := []string{
+		"svc 1 INFO user alice ip 10.0.0.1",
+		"svc 2 INFO user bob ip 10.0.0.2",
+		"svc 3 ERROR user carol ip 10.0.0.3",
+		"db 9 slow query 12ms shard 4",
+		"db 9 slow query 80ms shard 7",
+		"cache hit key foo region us",
+		"cache miss key bar region eu",
+	}
+	queries := []string{
+		"svc 4 INFO user dave ip 10.0.0.9", // hit, params
+		"db 9 slow query 5ms shard 1",      // hit, params
+		"cache hit key baz region ap",      // hit
+		"totally unknown shape here now",   // miss
+		"svc 5 ERROR user eve ip 1.2.3.4",  // hit
+	}
+
+	cfg := DefaultConfig()
+	cfg.MatchScorer = MatchScorerString
+	ms, err := TrainWithConfig(train, cfg)
+	if err != nil {
+		t.Fatalf("train string: %v", err)
+	}
+	cfg.MatchScorer = MatchScorerID
+	mi, err := TrainWithConfig(train, cfg)
+	if err != nil {
+		t.Fatalf("train id: %v", err)
+	}
+	if ms.useIDScorer {
+		t.Fatalf("MatchScorerString must not use the ID scorer")
+	}
+	if !mi.useIDScorer {
+		t.Fatalf("MatchScorerID must use the ID scorer")
+	}
+
+	for _, q := range queries {
+		idS, argsS, okS := ms.Match(q)
+		idI, argsI, okI := mi.Match(q)
+		if idS != idI || okS != okI || !reflect.DeepEqual(argsS, argsI) {
+			t.Fatalf("scorer mismatch for %q: string=(%d,%v,%v) id=(%d,%v,%v)",
+				q, idS, argsS, okS, idI, argsI, okI)
+		}
+	}
+
+	// Auto resolves from template count: this tiny dictionary is far below
+	// the threshold, so Auto must pick String.
+	cfg.MatchScorer = MatchScorerAuto
+	ma, err := TrainWithConfig(train, cfg)
+	if err != nil {
+		t.Fatalf("train auto: %v", err)
+	}
+	if len(ma.Templates()) >= autoScorerTemplateThreshold {
+		t.Fatalf("test assumption broken: too many templates")
+	}
+	if ma.useIDScorer {
+		t.Fatalf("MatchScorerAuto with a small dictionary must pick String")
+	}
+}
+
 // TestLogpaiMatchOnly covers Match()'s perfect-similarity semantics:
 // wildcard positions absorb any token, literal positions must match
 // exactly, and unknown shapes return no match.
@@ -154,6 +219,101 @@ func TestLogpaiMatchOnly(t *testing.T) {
 			t.Errorf("Match(%q): got no match, want id=%d", tc.line, tc.want)
 		case tc.want != 0 && id != tc.want:
 			t.Errorf("Match(%q): got id=%d, want id=%d", tc.line, id, tc.want)
+		}
+	}
+}
+
+func TestMatchExactPrefilterUsesNonParamAnchors(t *testing.T) {
+	lines := []string{
+		"100 level info service api status 200 latency 10",
+		"101 level info service api status 200 latency 11",
+		"102 level warn service worker status 500 latency 12",
+		"103 level warn service worker status 500 latency 13",
+	}
+
+	cfg := DefaultConfig()
+	withPrefilter, err := TrainWithConfig(lines, cfg)
+	if err != nil {
+		t.Fatalf("train with prefilter: %v", err)
+	}
+	cfg.EnableMatchPrefilter = false
+	withoutPrefilter, err := TrainWithConfig(lines, cfg)
+	if err != nil {
+		t.Fatalf("train without prefilter: %v", err)
+	}
+
+	queries := []string{
+		"104 level info service api status 200 latency 14",
+		"105 level warn service worker status 500 latency 15",
+		"106 level info service worker status 200 latency 16",
+	}
+	for _, query := range queries {
+		idA, argsA, okA := withPrefilter.MatchExactInto(query, nil)
+		idB, argsB, okB := withoutPrefilter.MatchExactInto(query, nil)
+		if idA != idB || okA != okB || !reflect.DeepEqual(argsA, argsB) {
+			t.Fatalf("exact prefilter mismatch for %q: with=(%d,%v,%v) without=(%d,%v,%v)", query, idA, argsA, okA, idB, argsB, okB)
+		}
+	}
+}
+
+func TestMatchExactTieBreakDeterministic(t *testing.T) {
+	// Overlapping param layouts so several templates can exactly match the
+	// same line. All templates have a param at position 0, so the tree
+	// router groups every candidate under the wildcard node and the
+	// prefilter-disabled path sees the same candidate set as the prefilter
+	// path — letting us assert both paths agree on the documented contract:
+	// most parametrized wins, ties broken by lowest template ID.
+	tmpl := func(id int, full []string) Template {
+		params := bitset.New(uint(len(full)))
+		dense := make([]string, 0, len(full))
+		for i, tok := range full {
+			if tok == "<*>" {
+				params.Set(uint(i))
+			} else {
+				dense = append(dense, tok)
+			}
+		}
+		return Template{ID: id, Tokens: dense, Params: params, TokenCount: len(full), Count: 1}
+	}
+	templates := []Template{
+		tmpl(10, []string{"<*>", "b", "z"}),   // paramCount 1
+		tmpl(20, []string{"<*>", "b", "<*>"}), // paramCount 2
+		tmpl(30, []string{"<*>", "<*>", "z"}), // paramCount 2
+	}
+
+	cases := []struct {
+		line   string
+		wantID int
+		wantOK bool
+	}{
+		{"x b z", 20, true}, // {10,20,30} qualify; max pc=2; tie 20<30 -> 20
+		{"x b w", 20, true}, // only 20 qualifies (pos1=b)
+		{"x y z", 30, true}, // only 30 qualifies (pos2=z)
+		{"x y w", 0, false}, // none qualify
+	}
+
+	cfg := DefaultConfig()
+	withPrefilter, err := NewMatcherFromTemplates(cfg, templates)
+	if err != nil {
+		t.Fatalf("build with prefilter: %v", err)
+	}
+	cfg.EnableMatchPrefilter = false
+	withoutPrefilter, err := NewMatcherFromTemplates(cfg, templates)
+	if err != nil {
+		t.Fatalf("build without prefilter: %v", err)
+	}
+
+	for _, tc := range cases {
+		// Repeat to catch scratch-buffer state leaking across calls.
+		for i := 0; i < 3; i++ {
+			idA, _, okA := withPrefilter.MatchExactInto(tc.line, nil)
+			if idA != tc.wantID || okA != tc.wantOK {
+				t.Fatalf("prefilter %q: got (%d,%v), want (%d,%v)", tc.line, idA, okA, tc.wantID, tc.wantOK)
+			}
+			idB, _, okB := withoutPrefilter.MatchExactInto(tc.line, nil)
+			if idB != tc.wantID || okB != tc.wantOK {
+				t.Fatalf("no-prefilter %q: got (%d,%v), want (%d,%v)", tc.line, idB, okB, tc.wantID, tc.wantOK)
+			}
 		}
 	}
 }
