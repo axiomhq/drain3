@@ -1,6 +1,7 @@
 package drain3
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 
@@ -8,13 +9,57 @@ import (
 	"github.com/lemire/constmap"
 )
 
-// Template is a trained log template.
+// Template is a trained log template and the stable shape for persisting a
+// trained matcher: export with Matcher.Templates(), persist with any codec the
+// caller chooses (JSON, gob, …), and rebuild with NewMatcherFromTemplates.
+//
+// The encoding is dense and is a versionless contract enforced on import by
+// validate: Tokens holds only the non-param tokens in order, Params marks the
+// parameter positions (bit i set => position i renders as ParamString), and
+// TokenCount is the total position count. The invariant
+// len(Tokens)+Params.Count() == TokenCount always holds, and Params must carry
+// no bits at or beyond TokenCount. If this layout ever changes incompatibly,
+// add a Version field so previously persisted templates remain distinguishable.
 type Template struct {
 	ID         int
 	Tokens     []string       // dense: only non-param tokens, in order
 	Params     *bitset.BitSet // bit i set = position i is a param placeholder
 	TokenCount int            // total number of positions (len(Tokens) + Params.Count())
 	Count      int            // number of matching log lines
+}
+
+// validate reports whether t is internally consistent. A Template arriving via
+// the round-trip boundary (Templates() -> NewMatcherFromTemplates) or handed to
+// NewRenderPlan is untrusted input: a nil Params, an out-of-bounds TokenCount,
+// or a TokenCount that disagrees with len(Tokens)+Params.Count() would otherwise
+// nil-deref, index out of range, or drive an unbounded allocation downstream.
+// maxTokens <= 0 disables the upper-bound check (used where no Config is in hand).
+func (t Template) validate(maxTokens int) error {
+	if t.TokenCount < 0 {
+		return fmt.Errorf("drain3: template %d: token count must be >= 0, got %d", t.ID, t.TokenCount)
+	}
+	if maxTokens > 0 && t.TokenCount > maxTokens {
+		return fmt.Errorf("drain3: template %d: token count %d exceeds max tokens %d", t.ID, t.TokenCount, maxTokens)
+	}
+	if t.Params == nil {
+		return fmt.Errorf("drain3: template %d: params bitset must not be nil", t.ID)
+	}
+	// Consumers (rebuildFromTemplates, NewRenderPlan) only Test() bits in
+	// [0,TokenCount). A param bit set at/beyond TokenCount would inflate the
+	// global Count() popcount below and let an under-length Tokens slice pass,
+	// then overrun the dense index downstream — so reject it outright. NextSet
+	// is O(words) and bounded, so a hostile TokenCount can't drive a long scan.
+	if idx, ok := t.Params.NextSet(uint(t.TokenCount)); ok {
+		return fmt.Errorf("drain3: template %d: param bit %d set at or beyond token count %d", t.ID, idx, t.TokenCount)
+	}
+	// With no stray high bits, Count() equals the in-range param positions, so
+	// this pins len(Tokens) to exactly the non-param positions the dense
+	// reconstruction loop reads, guaranteeing the index never overruns Tokens.
+	if got := len(t.Tokens) + int(t.Params.Count()); got != t.TokenCount {
+		return fmt.Errorf("drain3: template %d: %d dense tokens + %d params != token count %d",
+			t.ID, len(t.Tokens), int(t.Params.Count()), t.TokenCount)
+	}
+	return nil
 }
 
 // Matcher matches logs to trained Drain templates.
@@ -104,10 +149,6 @@ func (c *cluster) buildNonParamIdx(paramID uint64) {
 	}
 }
 
-func (c *cluster) rebuildNonParamIdx(paramID uint64) {
-	c.buildNonParamIdx(paramID)
-}
-
 func (c *cluster) extractArgsInto(lineTokens []string, paramID uint64, dst []string) []string {
 	if len(c.tokenIDs) == 0 || len(lineTokens) == 0 || c.paramCount == 0 {
 		return nil
@@ -189,7 +230,7 @@ func (m *Matcher) internToken(token string) uint64 {
 	return id
 }
 
-func (m *Matcher) freezeDict() {
+func (m *Matcher) freezeDict() error {
 	keys := make([]string, 0, len(m.dictIDs))
 	vals := make([]uint64, 0, len(m.dictIDs))
 	for k, v := range m.dictIDs {
@@ -198,7 +239,7 @@ func (m *Matcher) freezeDict() {
 	}
 	vm, err := constmap.NewVerified(keys, vals)
 	if err != nil {
-		panic("drain3: failed to build constmap: " + err.Error())
+		return fmt.Errorf("drain3: failed to build constmap: %w", err)
 	}
 	m.dictFrozen = vm
 	m.scratchCandidates = make([]int, 0, 1024)
@@ -214,6 +255,7 @@ func (m *Matcher) freezeDict() {
 			break
 		}
 	}
+	return nil
 }
 
 func tokenize(content string, extraDelimiters []string) []string {
@@ -271,10 +313,14 @@ func deepCopyTemplates(in []Template) []Template {
 	}
 	out := make([]Template, len(in))
 	for i := range in {
+		var params *bitset.BitSet
+		if in[i].Params != nil {
+			params = in[i].Params.Clone()
+		}
 		out[i] = Template{
 			ID:         in[i].ID,
 			Tokens:     slices.Clone(in[i].Tokens),
-			Params:     in[i].Params.Clone(),
+			Params:     params,
 			TokenCount: in[i].TokenCount,
 			Count:      in[i].Count,
 		}

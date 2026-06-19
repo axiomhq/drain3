@@ -15,6 +15,11 @@ func (m *Matcher) Match(line string) (templateID int, args []string, ok bool) {
 
 // MatchID returns just the template id and whether a match was found, without extracting args.
 func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
+	// Guard here, not only in findMatch: the call below passes m.scratchTok,
+	// which dereferences a nil receiver before findMatch's own nil check runs.
+	if m == nil {
+		return 0, false
+	}
 	cluster, _ := m.findMatch(line, m.scratchTok)
 	if cluster == nil {
 		return 0, false
@@ -24,6 +29,11 @@ func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
 
 // MatchInto returns template id, extracted args into dst, and whether a match was found.
 func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []string, ok bool) {
+	// Guard here, not only in findMatch: the call below passes m.scratchTok,
+	// which dereferences a nil receiver before findMatch's own nil check runs.
+	if m == nil {
+		return 0, nil, false
+	}
 	cluster, tokens := m.findMatch(line, m.scratchTok)
 	if cluster == nil {
 		return 0, nil, false

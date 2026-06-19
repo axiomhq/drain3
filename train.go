@@ -24,11 +24,19 @@ func TrainWithConfig(samples []string, cfg Config) (*Matcher, error) {
 	for _, sample := range samples {
 		m.addLogMessage(sample)
 	}
+	if err := m.finalize(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// finalize rebuilds every derived index from the current clusters and freezes
+// the token dictionary. Call once after clusters stop changing.
+func (m *Matcher) finalize() error {
 	m.syncTemplatesFromClusters()
 	m.rebuildMatchPrefilter()
 	m.rebuildMatchNeeded()
-	m.freezeDict()
-	return m, nil
+	return m.freezeDict()
 }
 
 // NewMatcherFromTemplates builds a matcher from pre-existing templates.
@@ -68,6 +76,9 @@ func (m *Matcher) rebuildFromTemplates(cfg Config, templates []Template) error {
 		if t.Count <= 0 {
 			return fmt.Errorf("template %d count must be > 0", t.ID)
 		}
+		if err := t.validate(next.cfg.MaxTokens); err != nil {
+			return err
+		}
 		if t.ID > maxID {
 			maxID = t.ID
 		}
@@ -96,10 +107,9 @@ func (m *Matcher) rebuildFromTemplates(cfg Config, templates []Template) error {
 			next.addSeqToPrefixTree(c)
 		}
 	}
-	next.syncTemplatesFromClusters()
-	next.rebuildMatchPrefilter()
-	next.rebuildMatchNeeded()
-	next.freezeDict()
+	if err := next.finalize(); err != nil {
+		return err
+	}
 
 	*m = *next
 	return nil
@@ -184,7 +194,7 @@ func (m *Matcher) addLogMessage(content string) {
 		}
 	}
 	if changed {
-		matchCluster.rebuildNonParamIdx(m.paramID)
+		matchCluster.buildNonParamIdx(m.paramID)
 	}
 	matchCluster.size++
 }

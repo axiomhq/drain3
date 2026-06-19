@@ -13,11 +13,16 @@ type renderSegment struct {
 	tail   []byte
 }
 
-// NewRenderPlan builds a render plan for t.
+// NewRenderPlan builds a render plan for t. It returns an error if t is
+// malformed (nil Params, or a TokenCount that disagrees with
+// len(Tokens)+Params.Count()) rather than panicking during rendering.
 //
 // maxArgLen is optional. When provided, it is called once for each parameter
 // position and included in MaxSize.
-func NewRenderPlan(t Template, maxArgLen func(arg int) int) RenderPlan {
+func NewRenderPlan(t Template, maxArgLen func(arg int) int) (RenderPlan, error) {
+	if err := t.validate(0); err != nil {
+		return RenderPlan{}, err
+	}
 	var head, cur []byte
 	var segments []renderSegment
 	argIdx, tokIdx := 0, 0
@@ -52,7 +57,7 @@ func NewRenderPlan(t Template, maxArgLen func(arg int) int) RenderPlan {
 			maxSize += maxArgLen(segment.argIdx)
 		}
 	}
-	return RenderPlan{head: head, segments: segments, maxSize: maxSize}
+	return RenderPlan{head: head, segments: segments, maxSize: maxSize}, nil
 }
 
 // MaxSize returns the upper bound calculated by NewRenderPlan.

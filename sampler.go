@@ -1,6 +1,9 @@
 package drain3
 
-import "math/rand"
+import (
+	"math"
+	"math/rand"
+)
 
 // strideSample draws roughly frac*len(lines) lines as fixed-size blocks at
 // regular strides with random jitter inside each stride window. Uses a seeded
@@ -8,9 +11,15 @@ import "math/rand"
 // input produces the same serialized bytes across runs and goroutines.
 func StrideSample(lines []string, frac float64, blockSize int) []string {
 	total := len(lines)
-	sampleN := int(float64(total) * frac)
-	if sampleN <= 0 || total == 0 {
+	if blockSize <= 0 || frac <= 0 || math.IsNaN(frac) || math.IsInf(frac, 0) || total == 0 {
 		return lines
+	}
+	sampleN := int(float64(total) * frac)
+	if sampleN <= 0 {
+		return lines
+	}
+	if sampleN > total {
+		sampleN = total
 	}
 	numBlocks := max(sampleN/blockSize, 1)
 	stride := max(total/numBlocks, blockSize)

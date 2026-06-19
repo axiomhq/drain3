@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/bits-and-blooms/bitset"
 )
 
 // renderTemplatePlaceholders expands a dense Template into its full
@@ -48,7 +50,7 @@ func TestLogpaiSSHDScenario(t *testing.T) {
 	}
 
 	want := map[string]int{
-		"Dec 10 <*> LabSZ <*> input_userauth_request: invalid user <*> [preauth]":             3,
+		"Dec 10 <*> LabSZ <*> input_userauth_request: invalid user <*> [preauth]":              3,
 		"Dec 10 <*> LabSZ <*> Failed password for invalid user <*> from 0.0.0.0 port <*> ssh2": 3,
 	}
 	got := map[string]int{}
@@ -619,4 +621,94 @@ func BenchmarkLargeMixed(b *testing.B) {
 		b.ReportMetric(float64(len(lines)), "lines/op")
 		b.ReportMetric(float64(matched), "matched/op")
 	})
+}
+
+// A malformed Template is hostile/partial input on the documented round-trip
+// boundary (Templates() -> NewMatcherFromTemplates). It must be rejected with
+// an error at construction, never panic an index/deref/OOM downstream.
+func TestNewMatcherFromTemplatesRejectsMalformed(t *testing.T) {
+	cfg := DefaultConfig()
+
+	twoNonParam := bitset.New(2) // no bits set => 2 non-param positions
+
+	bitWithStrayBit := func() *bitset.BitSet {
+		p := bitset.New(64)
+		p.Set(40) // set far beyond any TokenCount used in these cases
+		return p
+	}
+
+	cases := []struct {
+		name string
+		tmpl Template
+	}{
+		{
+			name: "nil params",
+			tmpl: Template{ID: 1, Tokens: []string{"a"}, Params: nil, TokenCount: 1, Count: 1},
+		},
+		{
+			name: "token count inconsistent with dense tokens",
+			tmpl: Template{ID: 1, Tokens: []string{"a"}, Params: twoNonParam, TokenCount: 2, Count: 1},
+		},
+		{
+			// A stray param bit beyond TokenCount inflates the global popcount.
+			// The consumer only reads bits in [0,TokenCount), so it must be rejected.
+			name: "stray param bit beyond token count",
+			tmpl: Template{ID: 1, Tokens: []string{"a", "b"}, Params: bitWithStrayBit(), TokenCount: 3, Count: 1},
+		},
+		{
+			name: "token count exceeds max tokens",
+			tmpl: Template{ID: 1, Tokens: []string{"a"}, Params: bitset.New(0), TokenCount: cfg.MaxTokens + 1, Count: 1},
+		},
+		{
+			name: "negative token count",
+			tmpl: Template{ID: 1, Tokens: nil, Params: bitset.New(0), TokenCount: -1, Count: 1},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := NewMatcherFromTemplates(cfg, []Template{tc.tmpl})
+			if err == nil {
+				t.Fatalf("expected error for malformed template, got nil (matcher=%v)", m)
+			}
+		})
+	}
+}
+
+// A well-formed round-trip must still succeed unchanged.
+func TestNewMatcherFromTemplatesRoundTripStillValid(t *testing.T) {
+	m, err := Train([]string{"user alice logged in", "user bob logged in"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewMatcherFromTemplates(m.Config(), m.Templates())
+	if err != nil {
+		t.Fatalf("well-formed round-trip rejected: %v", err)
+	}
+	if len(got.Templates()) != len(m.Templates()) {
+		t.Fatalf("template count changed across round-trip: %d -> %d", len(m.Templates()), len(got.Templates()))
+	}
+}
+
+// deepCopyTemplates is the export half of the round-trip (Templates()). It must
+// not panic if a Template carries a nil Params; it should copy it as nil.
+func TestDeepCopyTemplatesToleratesNilParams(t *testing.T) {
+	out := deepCopyTemplates([]Template{
+		{ID: 1, Tokens: []string{"a"}, Params: nil, TokenCount: 1, Count: 1},
+	})
+	if len(out) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(out))
+	}
+	if out[0].Params != nil {
+		t.Fatalf("expected nil Params preserved, got %v", out[0].Params)
+	}
+}
+
+func TestValidateTemplateErrorMentionsID(t *testing.T) {
+	_, err := NewMatcherFromTemplates(DefaultConfig(), []Template{
+		{ID: 7, Tokens: []string{"a"}, Params: nil, TokenCount: 1, Count: 1},
+	})
+	if err == nil || !strings.Contains(err.Error(), "7") {
+		t.Fatalf("error should identify template id 7, got %v", err)
+	}
 }
