@@ -103,3 +103,70 @@ func TestSessionRebindsAfterRebuild(t *testing.T) {
 		t.Fatalf("default session back-pointer not rebound to the published Matcher")
 	}
 }
+
+// TestMatchBatchEquivalence pins MatchBatch to per-line MatchInto.
+func TestMatchBatchEquivalence(t *testing.T) {
+	m, err := Train([]string{
+		"svc auth user 1 ip 10.0.0.1",
+		"svc auth user 2 ip 10.0.0.2",
+		"cache hit key foo",
+		"cache miss key bar",
+	})
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+	s := m.NewSession()
+	lines := []string{
+		"svc auth user 9 ip 1.2.3.4",
+		"totally unknown shape",
+		"cache hit key baz",
+		"",
+		"svc auth user 10 ip 8.8.8.8",
+	}
+	res := s.MatchBatch(lines, nil)
+	if len(res.IDs) != len(lines) || len(res.ArgOff) != len(lines)+1 {
+		t.Fatalf("shape: IDs=%d ArgOff=%d want %d/%d", len(res.IDs), len(res.ArgOff), len(lines), len(lines)+1)
+	}
+	if res.ArgOff[0] != 0 {
+		t.Fatalf("ArgOff[0] = %d, want 0", res.ArgOff[0])
+	}
+	for i, line := range lines {
+		id, args, ok := s.MatchInto(line, nil)
+		gotArgs := res.Args[res.ArgOff[i]:res.ArgOff[i+1]]
+		if !ok {
+			if res.IDs[i] != 0 || len(gotArgs) != 0 {
+				t.Fatalf("line %d %q: want miss, got id=%d args=%v", i, line, res.IDs[i], gotArgs)
+			}
+			continue
+		}
+		if int(res.IDs[i]) != id || len(gotArgs) != len(args) {
+			t.Fatalf("line %d %q: batch=(%d,%v) perline=(%d,%v)", i, line, res.IDs[i], gotArgs, id, args)
+		}
+		for j := range args {
+			if gotArgs[j] != args[j] {
+				t.Fatalf("line %d arg %d: %q vs %q", i, j, gotArgs[j], args[j])
+			}
+		}
+	}
+}
+
+// TestMatchBatchReuse verifies a warm BatchResult allocates nothing.
+func TestMatchBatchReuse(t *testing.T) {
+	m, err := Train([]string{
+		"svc auth user 1 ip 10.0.0.1",
+		"svc auth user 2 ip 10.0.0.2",
+	})
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+	s := m.NewSession()
+	lines := []string{"svc auth user 9 ip 1.2.3.4", "nope", "svc auth user 3 ip 2.2.2.2"}
+	var res BatchResult
+	s.MatchBatch(lines, &res) // warm the arena
+	allocs := testing.AllocsPerRun(100, func() {
+		s.MatchBatch(lines, &res)
+	})
+	if allocs != 0 {
+		t.Fatalf("warm MatchBatch allocates %v per run, want 0", allocs)
+	}
+}

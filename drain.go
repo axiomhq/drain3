@@ -149,20 +149,27 @@ func (c *cluster) rebuildNonParamIdx(paramID uint64) {
 	c.buildNonParamIdx(paramID)
 }
 
+// appendArgs appends the tokens at c's param positions to dst and
+// returns it. The appended strings alias lineTokens' backing line.
+func (c *cluster) appendArgs(dst []string, lineTokens []string, paramID uint64) []string {
+	limit := min(len(c.tokenIDs), len(lineTokens))
+	for i := 0; i < limit; i++ {
+		if c.tokenIDs[i] == paramID {
+			dst = append(dst, lineTokens[i])
+		}
+	}
+	return dst
+}
+
 func (c *cluster) extractArgsInto(lineTokens []string, paramID uint64, dst []string) []string {
 	if len(c.tokenIDs) == 0 || len(lineTokens) == 0 || c.paramCount == 0 {
 		return nil
 	}
-	limit := min(len(c.tokenIDs), len(lineTokens))
 	args := dst[:0]
-	if cap(args) < min(c.paramCount, limit) {
+	if cap(args) < min(c.paramCount, min(len(c.tokenIDs), len(lineTokens))) {
 		args = make([]string, 0, c.paramCount)
 	}
-	for i := 0; i < limit; i++ {
-		if c.tokenIDs[i] == paramID {
-			args = append(args, lineTokens[i])
-		}
-	}
+	args = c.appendArgs(args, lineTokens, paramID)
 	if len(args) == 0 {
 		return nil
 	}

@@ -60,3 +60,44 @@ func (s *Session) MatchExactInto(line string, dst []string) (templateID int, arg
 	}
 	return cluster.id, cluster.extractArgsInto(tokens, s.m.paramID, dst), true
 }
+
+// BatchResult holds MatchBatch output. Reuse it across calls: all
+// slices are truncated and refilled, so a warm result allocates
+// nothing. Args entries alias the input lines and keep them alive.
+type BatchResult struct {
+	IDs    []int32  // per line: matched template ID, 0 = miss
+	ArgOff []int32  // prefix offsets, len(lines)+1: line i's args are Args[ArgOff[i]:ArgOff[i+1]]
+	Args   []string // extracted args, back to back
+}
+
+func (r *BatchResult) reset(n int) {
+	if cap(r.IDs) < n {
+		r.IDs = make([]int32, 0, n)
+		r.ArgOff = make([]int32, 0, n+1)
+	}
+	r.IDs = r.IDs[:0]
+	r.ArgOff = append(r.ArgOff[:0], 0)
+	r.Args = r.Args[:0]
+}
+
+// MatchBatch matches every line and writes struct-of-arrays results
+// into dst, allocating a fresh BatchResult when dst is nil. Template
+// IDs are dense and far below MaxInt32 in any trainable dictionary.
+func (s *Session) MatchBatch(lines []string, dst *BatchResult) *BatchResult {
+	if dst == nil {
+		dst = &BatchResult{}
+	}
+	dst.reset(len(lines))
+	paramID := s.m.paramID
+	for _, line := range lines {
+		cluster, tokens := s.findMatch(line)
+		if cluster == nil {
+			dst.IDs = append(dst.IDs, 0)
+		} else {
+			dst.IDs = append(dst.IDs, int32(cluster.id))
+			dst.Args = cluster.appendArgs(dst.Args, tokens, paramID)
+		}
+		dst.ArgOff = append(dst.ArgOff, int32(len(dst.Args)))
+	}
+	return dst
+}

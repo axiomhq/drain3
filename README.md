@@ -79,6 +79,10 @@ If you don't need the extracted params:
 id, ok := m.MatchID(line)
 ```
 
+### Batch matching
+
+For block workloads (e.g. column compression) use `Session.MatchBatch`: `s := m.NewSession(); res := s.MatchBatch(lines, &reusable)` returns struct-of-arrays results (`IDs`, and `Args` with `ArgOff` prefix offsets) and allocates nothing once the reusable result is warm. A trained `Matcher` is immutable — share it across goroutines with one `Session` per goroutine.
+
 ## API surface
 
 | Function | Purpose |
