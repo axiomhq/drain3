@@ -9,26 +9,26 @@ import (
 )
 
 // Match returns template id, extracted args, and whether a match was found.
+// Matcher-level Match* methods share one internal Session and follow the
+// one-goroutine-per-Matcher rule; use NewSession for concurrent matching.
 func (m *Matcher) Match(line string) (templateID int, args []string, ok bool) {
 	return m.MatchInto(line, nil)
 }
 
 // MatchID returns just the template id and whether a match was found, without extracting args.
 func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
-	cluster, _ := m.findMatch(line, m.scratchTok)
-	if cluster == nil {
+	if m == nil || m.defaultSession == nil {
 		return 0, false
 	}
-	return cluster.id, true
+	return m.defaultSession.MatchID(line)
 }
 
 // MatchInto returns template id, extracted args into dst, and whether a match was found.
 func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []string, ok bool) {
-	cluster, tokens := m.findMatch(line, m.scratchTok)
-	if cluster == nil {
+	if m == nil || m.defaultSession == nil {
 		return 0, nil, false
 	}
-	return cluster.id, cluster.extractArgsInto(tokens, m.paramID, dst), true
+	return m.defaultSession.MatchInto(line, dst)
 }
 
 // MatchExactInto returns a match only when every non-param template token
@@ -36,27 +36,27 @@ func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []s
 // as wildcards. When several templates qualify, the most parametrized one is
 // returned, ties broken by lowest template ID, so the result is deterministic.
 func (m *Matcher) MatchExactInto(line string, dst []string) (templateID int, args []string, ok bool) {
-	cluster, tokens := m.findExactMatch(line, m.scratchTok)
-	if cluster == nil {
+	if m == nil || m.defaultSession == nil {
 		return 0, nil, false
 	}
-	return cluster.id, cluster.extractArgsInto(tokens, m.paramID, dst), true
+	return m.defaultSession.MatchExactInto(line, dst)
 }
 
-func (m *Matcher) findMatch(line string, tokenBuf []string) (cluster *cluster, tokens []string) {
-	tokens, tokenCount, firstID, ok := m.tokenizeMatchLine(line, tokenBuf)
+func (s *Session) findMatch(line string) (cluster *cluster, tokens []string) {
+	tokens, tokenCount, firstID, ok := s.tokenizeMatchLine(line)
 	if !ok {
 		return nil, nil
 	}
+	m := s.m
 	// Fast path: prefilter narrows by token count + first/last token, then
 	// scores candidates by string comparison, or — when the candidate set
 	// is large enough to amortize resolving all tokens to dictionary IDs —
 	// by uint64 comparison (see useIDScorerFor).
 	if m.cfg.EnableMatchPrefilter && tokenCount < len(m.prefilterBuckets) {
-		buf := m.scratchCandidates
+		buf := s.candidates
 		if candidateIDs, owned, ok := m.prefilterCandidatesCompact(tokens, tokenCount, firstID, buf[:0]); ok {
 			if owned && cap(candidateIDs) > cap(buf) {
-				m.scratchCandidates = candidateIDs[:0:cap(candidateIDs)]
+				s.candidates = candidateIDs[:0:cap(candidateIDs)]
 			}
 			if m.useIDScorerFor(len(candidateIDs), tokenCount) {
 				var idBuf [128]uint64
@@ -73,16 +73,17 @@ func (m *Matcher) findMatch(line string, tokenBuf []string) (cluster *cluster, t
 	return m.treeSearch(tokenIDs, m.cfg.MatchThreshold, true, false), tokens
 }
 
-func (m *Matcher) findExactMatch(line string, tokenBuf []string) (cluster *cluster, tokens []string) {
-	tokens, tokenCount, _, ok := m.tokenizeMatchLine(line, tokenBuf)
+func (s *Session) findExactMatch(line string) (cluster *cluster, tokens []string) {
+	tokens, tokenCount, _, ok := s.tokenizeMatchLine(line)
 	if !ok {
 		return nil, nil
 	}
+	m := s.m
 	if m.cfg.EnableMatchPrefilter && tokenCount < len(m.prefilterBuckets) {
-		buf := m.scratchCandidates
-		if candidateIDs, owned, ok := m.prefilterExactCandidatesCompact(tokens, tokenCount, buf[:0]); ok {
+		buf := s.candidates
+		if candidateIDs, owned, ok := s.prefilterExactCandidatesCompact(tokens, tokenCount, buf[:0]); ok {
 			if owned && cap(candidateIDs) > cap(buf) {
-				m.scratchCandidates = candidateIDs[:0:cap(candidateIDs)]
+				s.candidates = candidateIDs[:0:cap(candidateIDs)]
 			}
 			if m.useIDScorerFor(len(candidateIDs), tokenCount) {
 				var idBuf [128]uint64
@@ -103,8 +104,9 @@ func (m *Matcher) findExactMatch(line string, tokenBuf []string) (cluster *clust
 // dictionary ID of the first token when the quick-reject path resolved it
 // (so the prefilter can reuse it instead of hashing the same token again);
 // otherwise it is constmap.NotFound, meaning "caller must resolve".
-func (m *Matcher) tokenizeMatchLine(line string, tokenBuf []string) (tokens []string, tokenCount int, firstID uint64, ok bool) {
-	if m == nil || len(line) > m.cfg.MaxBytes {
+func (s *Session) tokenizeMatchLine(line string) (tokens []string, tokenCount int, firstID uint64, ok bool) {
+	m := s.m
+	if len(line) > m.cfg.MaxBytes {
 		return nil, 0, constmap.NotFound, false
 	}
 	firstID = constmap.NotFound
@@ -124,7 +126,7 @@ func (m *Matcher) tokenizeMatchLine(line string, tokenBuf []string) (tokens []st
 		firstID = id
 	}
 	if len(m.cfg.ExtraDelimiters) == 0 {
-		tokens, tokenCount = tokenizeWhitespaceCount(line, tokenBuf, m.cfg.MaxTokens)
+		tokens, tokenCount = tokenizeWhitespaceCount(line, s.tok, m.cfg.MaxTokens)
 		if tokenCount > m.cfg.MaxTokens {
 			return nil, 0, constmap.NotFound, false
 		}
@@ -741,7 +743,7 @@ func (m *Matcher) rebuildMatchPrefilter() {
 			maxProbe = n
 		}
 	}
-	m.scratchProbeIDs = make([]uint64, maxProbe)
+	m.maxProbe = maxProbe
 
 	m.prefilterBuckets = buckets
 }
@@ -851,8 +853,8 @@ func (m *Matcher) prefilterCandidatesCompact(tokens []string, tokenCount int, fi
 	return mergePrefilterGroups(groups, dst)
 }
 
-func (m *Matcher) prefilterExactCandidatesCompact(tokens []string, tokenCount int, dst []int) (candidates []int, owned bool, ok bool) {
-	b := &m.prefilterBuckets[tokenCount]
+func (s *Session) prefilterExactCandidatesCompact(tokens []string, tokenCount int, dst []int) (candidates []int, owned bool, ok bool) {
+	b := &s.m.prefilterBuckets[tokenCount]
 	var groupBuf [16][]int
 	groupCount := 1 + len(b.anchorSlot) + len(b.anchorPairSlot)
 	groups := groupBuf[:0]
@@ -866,10 +868,10 @@ func (m *Matcher) prefilterExactCandidatesCompact(tokens []string, tokenCount in
 	// Resolve each distinct anchor position once; every probe below reads
 	// its slot. Anchor positions are always < tokenCount: the bucket is
 	// keyed by token count and anchors come from its own templates.
-	dict := m.dictFrozen
-	ids := m.scratchProbeIDs[:len(b.probePos)]
-	for s, pos := range b.probePos {
-		ids[s] = dict.Map(tokens[pos])
+	dict := s.m.dictFrozen
+	ids := s.probeIDs[:len(b.probePos)]
+	for slotIdx, pos := range b.probePos {
+		ids[slotIdx] = dict.Map(tokens[pos])
 	}
 	for i, slot := range b.anchorSlot {
 		id := ids[slot]

@@ -45,11 +45,15 @@ type Matcher struct {
 
 	hasParamFirst bool // true if any cluster has paramID at position 0
 
-	// Scratch buffers — reused across calls.
-	scratchIDs        []uint64
-	scratchTok        []string
-	scratchCandidates []int
-	scratchProbeIDs   []uint64 // per-line anchor-position ID resolutions, indexed by probePos slot
+	maxProbe int // widest probePos across prefilter buckets; sizes Session.probeIDs
+
+	// Training-only scratch. Match-path scratch lives on Session.
+	scratchIDs []uint64
+	scratchTok []string
+
+	// defaultSession backs the Matcher-level Match* methods, preserving
+	// the historical one-goroutine-per-Matcher contract for them.
+	defaultSession *Session
 }
 
 type prefilterBucket struct {
@@ -238,7 +242,6 @@ func (m *Matcher) freezeDict() {
 		panic("drain3: failed to build constmap: " + err.Error())
 	}
 	m.dictFrozen = vm
-	m.scratchCandidates = make([]int, 0, 1024)
 	if cap(m.scratchTok) < m.cfg.MaxTokens {
 		m.scratchTok = make([]string, 0, m.cfg.MaxTokens)
 	}
@@ -251,6 +254,7 @@ func (m *Matcher) freezeDict() {
 			break
 		}
 	}
+	m.defaultSession = m.NewSession()
 }
 
 func tokenize(content string, extraDelimiters []string) []string {
