@@ -81,7 +81,8 @@ func TestSpaceBitmap(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(11))
 	cases := []string{"", " ", "a", strings.Repeat(" ", 200), strings.Repeat("x", 200)}
-	for n := 0; n <= 200; n++ { // every length crossing 64B block boundaries
+	cases = append(cases, strings.Repeat("token pair  ", 512)) // 6KB, block-crossing spaces
+	for n := 0; n <= 200; n++ {                                // every length crossing 64B block boundaries
 		b := make([]byte, n)
 		for i := range b {
 			b[i] = [6]byte{' ', 'a', 0x1F, 0x21, 0x00, 0xFF}[rng.Intn(6)]
@@ -137,4 +138,44 @@ func BenchmarkTokenizeWhitespaceCount(b *testing.B) {
 			})
 		}
 	}
+}
+
+// FuzzSpaceBitmap locks spaceBitmap (asm + tail on arm64, SWAR elsewhere)
+// against the naive per-byte scan on arbitrary inputs.
+func FuzzSpaceBitmap(f *testing.F) {
+	f.Add("a b  c")
+	f.Add(strings.Repeat(" x", 100))
+	f.Fuzz(func(t *testing.T, s string) {
+		want := make([]uint64, bitmapWords(len(s)))
+		for i := 0; i < len(s); i++ {
+			if s[i] == ' ' {
+				want[i>>6] |= 1 << (i & 63)
+			}
+		}
+		got := make([]uint64, bitmapWords(len(s)))
+		spaceBitmap(s, got)
+		if !slices.Equal(got, want) {
+			t.Fatalf("spaceBitmap(%q): got %x want %x", s, got, want)
+		}
+	})
+}
+
+// BenchmarkSpaceBitmap compares the platform kernel (NEON blocks + SWAR
+// tail on arm64) against the pure-Go SWAR kernel on a real-corpus-shaped
+// line.
+func BenchmarkSpaceBitmap(b *testing.B) {
+	long := strings.Repeat("longishtoken ", 24)[:24*13-1]
+	bm := make([]uint64, bitmapWords(len(long)))
+	b.Run("kernel", func(b *testing.B) {
+		b.SetBytes(int64(len(long)))
+		for b.Loop() {
+			spaceBitmap(long, bm)
+		}
+	})
+	b.Run("swar", func(b *testing.B) {
+		b.SetBytes(int64(len(long)))
+		for b.Loop() {
+			spaceBitmapSWAR(long, bm)
+		}
+	})
 }
