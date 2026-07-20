@@ -6,18 +6,17 @@ import "fmt"
 type MatchScorer int
 
 const (
-	// MatchScorerAuto (zero value) picks String or ID at build time from
-	// the trained template count: small dictionaries use String (no
-	// regression), large ones use ID (the up-front token-ID resolution
-	// amortizes across the larger candidate scans). See autoScorerTemplateThreshold.
+	// MatchScorerAuto (zero value) picks String or ID per line from the
+	// prefilter candidate count: few candidates use String (no per-token
+	// hashing), many use ID (the up-front token-ID resolution amortizes
+	// across the larger candidate scans).
 	MatchScorerAuto MatchScorer = iota
-	// MatchScorerString compares candidate tokens as strings. No speedup,
-	// no regression on any workload. Best for small dictionaries or
-	// miss-dominated streams.
+	// MatchScorerString compares candidate tokens as strings. Best when
+	// candidate sets are known to be small relative to line length.
 	MatchScorerString
 	// MatchScorerID resolves line tokens to dictionary IDs once and
-	// compares uint64s. Large win for large-dictionary, hit-dominated
-	// streams; a modest penalty on misses.
+	// compares uint64s. Best for dense buckets where many candidates
+	// share a prefilter group; a penalty on long lines with few candidates.
 	MatchScorerID
 )
 
@@ -36,13 +35,6 @@ type Config struct {
 	EnableMatchPrefilter     bool
 	MatchScorer              MatchScorer // zero value = MatchScorerAuto
 }
-
-// autoScorerTemplateThreshold is the trained-template count at or above
-// which MatchScorerAuto resolves to MatchScorerID. Below it, ID's up-front
-// per-line token resolution does not amortize over the small candidate
-// scans, so String is used. Heuristic: small dictionaries (hundreds) favor
-// String; larger ones (≈thousands) favor ID by a wide margin.
-const autoScorerTemplateThreshold = 1024
 
 // DefaultConfig returns default Drain settings.
 func DefaultConfig() Config {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,6 +25,93 @@ func renderTemplatePlaceholders(t Template, paramStr string) string {
 		}
 	}
 	return strings.Join(out, " ")
+}
+
+// TestTokenizeWhitespaceCount locks the SWAR tokenizer against a naive
+// byte-at-a-time reference, including bytes chosen to trigger borrow
+// propagation in the SWAR mask (0x1F/0x21 around ' ', 0x01/0x80).
+// tokenizeWhitespaceRef is the naive byte-at-a-time tokenizer the SWAR
+// implementation replaced: the oracle for TestTokenizeWhitespaceCount and
+// the baseline for BenchmarkTokenizeWhitespaceCount.
+func tokenizeWhitespaceRef(content string, dst []string, maxTokens int) ([]string, int) {
+	if content == "" || maxTokens <= 0 {
+		return dst[:0], 0
+	}
+	dst = dst[:0]
+	start, count := 0, 1
+	for i := 0; i < len(content); i++ {
+		if content[i] != ' ' {
+			continue
+		}
+		dst = append(dst, content[start:i])
+		start = i + 1
+		count++
+		if count > maxTokens {
+			return dst, count
+		}
+	}
+	return append(dst, content[start:]), count
+}
+
+// TestTokenizeWhitespaceCount locks the SWAR tokenizer against the naive
+// reference, including bytes chosen to stress the SWAR mask (0x1F/0x21
+// around ' ', 0x01/0x80) and maxTokens truncation.
+func TestTokenizeWhitespaceCount(t *testing.T) {
+	check := func(s string, maxTok int) {
+		t.Helper()
+		want, wantN := tokenizeWhitespaceRef(s, nil, maxTok)
+		got, gotN := tokenizeWhitespaceCount(s, nil, maxTok)
+		if gotN != wantN || !slices.Equal(got, want) {
+			t.Fatalf("tokenize(%q, maxTok=%d): got (%q, %d), want (%q, %d)", s, maxTok, got, gotN, want, wantN)
+		}
+	}
+	edge := []string{
+		"", " ", "  ", "a", "a ", " a", "a b", "a  b", "   ",
+		"abcdefgh", "abcdefg ", "        x", "x        ",
+		"\x01\x80  \x01\x80", "a\x1f b\x21c",
+		strings.Repeat(" ", 100), strings.Repeat("ab ", 100),
+	}
+	for _, s := range edge {
+		for _, mt := range []int{0, 1, 2, 3, 64} {
+			check(s, mt)
+		}
+	}
+	rng := rand.New(rand.NewSource(7))
+	alphabet := []byte{' ', ' ', 0x1F, 0x21, 0xA0, 0x01, 0x80, 'z'}
+	for i := 0; i < 5000; i++ {
+		b := make([]byte, rng.Intn(40))
+		for j := range b {
+			b[j] = alphabet[rng.Intn(len(alphabet))]
+		}
+		check(string(b), 64)
+		check(string(b), 3)
+	}
+}
+
+// BenchmarkTokenizeWhitespaceCount pins the SWAR tokenizer against the
+// naive byte-loop reference on two token-length regimes: long tokens
+// (~12 B, real-corpus shaped) where the 8-byte windows win most, and
+// short tokens (~4 B) where per-window mask reuse must still keep SWAR
+// ahead of the byte loop.
+func BenchmarkTokenizeWhitespaceCount(b *testing.B) {
+	long := strings.Repeat("longishtoken ", 24)[:24*13-1] // 24 tokens, 12 B each
+	short := strings.Repeat("svc auth ok 1 ", 6)[:6*14-1] // 24 tokens, ~3 B each
+	for _, tc := range []struct {
+		name string
+		fn   func(string, []string, int) ([]string, int)
+	}{{"swar", tokenizeWhitespaceCount}, {"ref", tokenizeWhitespaceRef}} {
+		for _, in := range []struct {
+			name, line string
+		}{{"long", long}, {"short", short}} {
+			b.Run(tc.name+"_"+in.name, func(b *testing.B) {
+				b.SetBytes(int64(len(in.line)))
+				dst := make([]string, 0, 64)
+				for b.Loop() {
+					dst, _ = tc.fn(in.line, dst, 64)
+				}
+			})
+		}
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -128,7 +216,7 @@ func TestLogpaiShortMessage(t *testing.T) {
 
 // TestMatchScorerEquivalence asserts the String and ID scorers return
 // byte-identical results (the dictionary-injective safety property), and
-// that MatchScorerAuto resolves from the trained template count.
+// that MatchScorerAuto resolves per line from the candidate count.
 func TestMatchScorerEquivalence(t *testing.T) {
 	train := []string{
 		"svc 1 INFO user alice ip 10.0.0.1",
@@ -158,34 +246,37 @@ func TestMatchScorerEquivalence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("train id: %v", err)
 	}
-	if ms.useIDScorer {
-		t.Fatalf("MatchScorerString must not use the ID scorer")
+	if ms.useIDScorerFor(1000, 1) {
+		t.Fatalf("MatchScorerString must never use the ID scorer")
 	}
-	if !mi.useIDScorer {
-		t.Fatalf("MatchScorerID must use the ID scorer")
-	}
-
-	for _, q := range queries {
-		idS, argsS, okS := ms.Match(q)
-		idI, argsI, okI := mi.Match(q)
-		if idS != idI || okS != okI || !reflect.DeepEqual(argsS, argsI) {
-			t.Fatalf("scorer mismatch for %q: string=(%d,%v,%v) id=(%d,%v,%v)",
-				q, idS, argsS, okS, idI, argsI, okI)
-		}
+	if !mi.useIDScorerFor(1, 1000) {
+		t.Fatalf("MatchScorerID must always use the ID scorer")
 	}
 
-	// Auto resolves from template count: this tiny dictionary is far below
-	// the threshold, so Auto must pick String.
 	cfg.MatchScorer = MatchScorerAuto
 	ma, err := TrainWithConfig(train, cfg)
 	if err != nil {
 		t.Fatalf("train auto: %v", err)
 	}
-	if len(ma.Templates()) >= autoScorerTemplateThreshold {
-		t.Fatalf("test assumption broken: too many templates")
+	if ma.useIDScorerFor(3, 26) {
+		t.Fatalf("MatchScorerAuto with few candidates must pick String")
 	}
-	if ma.useIDScorer {
-		t.Fatalf("MatchScorerAuto with a small dictionary must pick String")
+	if !ma.useIDScorerFor(200, 10) {
+		t.Fatalf("MatchScorerAuto with many candidates must pick ID")
+	}
+
+	for _, q := range queries {
+		idS, argsS, okS := ms.Match(q)
+		idI, argsI, okI := mi.Match(q)
+		idA, argsA, okA := ma.Match(q)
+		if idS != idI || okS != okI || !reflect.DeepEqual(argsS, argsI) {
+			t.Fatalf("scorer mismatch for %q: string=(%d,%v,%v) id=(%d,%v,%v)",
+				q, idS, argsS, okS, idI, argsI, okI)
+		}
+		if idS != idA || okS != okA || !reflect.DeepEqual(argsS, argsA) {
+			t.Fatalf("auto scorer mismatch for %q: string=(%d,%v,%v) auto=(%d,%v,%v)",
+				q, idS, argsS, okS, idA, argsA, okA)
+		}
 	}
 }
 
@@ -586,21 +677,7 @@ func BenchmarkTrainMatch(b *testing.B) {
 	}
 	b.Logf("templates: %d", len(m.Templates()))
 
-	b.Run("match_into", func(b *testing.B) {
-		b.ReportAllocs()
-		scratch := make([]string, 0, 16)
-		var matched int
-		for b.Loop() {
-			matched = 0
-			for _, line := range matchLines {
-				if _, _, ok := m.MatchInto(line, scratch[:0]); ok {
-					matched++
-				}
-			}
-		}
-		b.ReportMetric(float64(len(matchLines)), "lines/op")
-		b.ReportMetric(float64(matched), "matched/op")
-	})
+	benchMatchInto(b, "match_into", m, matchLines)
 
 	// Big-dict workload: many token-count buckets × ~MaxChildren
 	// first-token variants × diverse per-cluster tokens, so training
@@ -637,61 +714,42 @@ func BenchmarkTrainMatch(b *testing.B) {
 	}
 	b.Logf("bigdict templates: %d, dict size: %d", len(mBig.Templates()), len(mBig.dictIDs))
 
-	b.Run("match_bigdict_hit", func(b *testing.B) {
-		b.ReportAllocs()
-		scratch := make([]string, 0, 16)
-		var matched int
-		for b.Loop() {
-			matched = 0
-			for _, line := range bigLines {
-				if _, _, ok := mBig.MatchInto(line, scratch[:0]); ok {
-					matched++
-				}
-			}
-		}
-		b.ReportMetric(float64(len(bigLines)), "lines/op")
-		b.ReportMetric(float64(matched), "matched/op")
-	})
+	benchMatchInto(b, "match_bigdict_hit", mBig, bigLines)
 
 	bigMiss := make([]string, len(bigLines))
 	for i, l := range bigLines {
 		bigMiss[i] = "zzzzz-unknown " + l
 	}
-	b.Run("match_bigdict_miss", func(b *testing.B) {
-		b.ReportAllocs()
-		scratch := make([]string, 0, 16)
-		var matched int
-		for b.Loop() {
-			matched = 0
-			for _, line := range bigMiss {
-				if _, _, ok := mBig.MatchInto(line, scratch[:0]); ok {
-					matched++
-				}
-			}
-		}
-		b.ReportMetric(float64(len(bigMiss)), "lines/op")
-		b.ReportMetric(float64(matched), "matched/op")
-	})
+	benchMatchInto(b, "match_bigdict_miss", mBig, bigMiss)
 
 	missLines := make([]string, len(matchLines))
 	for i, l := range matchLines {
 		missLines[i] = "zzz-unknown " + l
 	}
-	b.Run("match_miss", func(b *testing.B) {
-		b.ReportAllocs()
-		scratch := make([]string, 0, 16)
-		var matched int
-		for b.Loop() {
-			matched = 0
-			for _, line := range missLines {
-				if _, _, ok := m.MatchInto(line, scratch[:0]); ok {
-					matched++
-				}
-			}
+	benchMatchInto(b, "match_miss", m, missLines)
+
+	// Scorer break-even pin: MatchScorerAuto picks String below
+	// candidates ≈ tokenCount and ID above it (useIDScorerFor). These
+	// four sub-benchmarks reproduce both sides: the merge workload has
+	// ~1 candidate per line (String must win), the bigdict workload has
+	// hundreds per bucket (ID must win, historically 3x).
+	for _, sc := range []struct {
+		name   string
+		scorer MatchScorer
+	}{{"string", MatchScorerString}, {"id", MatchScorerID}} {
+		cfg := DefaultConfig()
+		cfg.MatchScorer = sc.scorer
+		mSc, err := TrainWithConfig(trainMerge, cfg)
+		if err != nil {
+			b.Fatal(err)
 		}
-		b.ReportMetric(float64(len(missLines)), "lines/op")
-		b.ReportMetric(float64(matched), "matched/op")
-	})
+		mBigSc, err := TrainWithConfig(bigLines, cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchMatchInto(b, "match_into_"+sc.name, mSc, matchLines)
+		benchMatchInto(b, "match_bigdict_hit_"+sc.name, mBigSc, bigLines)
+	}
 }
 
 // BenchmarkLargeMixed models a realistic production workload:
@@ -764,7 +822,13 @@ func BenchmarkLargeMixed(b *testing.B) {
 	b.Logf("trained: templates=%d, dict=%d, train_lines=%d, total=%d",
 		len(m.Templates()), len(m.dictIDs), len(trainLines), total)
 
-	b.Run("match_all", func(b *testing.B) {
+	benchMatchInto(b, "match_all", m, lines)
+}
+
+// benchMatchInto runs a named MatchInto sub-benchmark over lines,
+// reporting lines/op and matched/op.
+func benchMatchInto(b *testing.B, name string, m *Matcher, lines []string) {
+	b.Run(name, func(b *testing.B) {
 		b.ReportAllocs()
 		scratch := make([]string, 0, 16)
 		var matched int

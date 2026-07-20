@@ -49,15 +49,16 @@ func (m *Matcher) findMatch(line string, tokenBuf []string) (cluster *cluster, t
 		return nil, nil
 	}
 	// Fast path: prefilter narrows by token count + first/last token, then
-	// resolves all tokens to dictionary IDs once and scores by uint64
-	// comparison instead of per-token string memequal.
+	// scores candidates by string comparison, or — when the candidate set
+	// is large enough to amortize resolving all tokens to dictionary IDs —
+	// by uint64 comparison (see useIDScorerFor).
 	if m.cfg.EnableMatchPrefilter && tokenCount < len(m.prefilterBuckets) {
 		buf := m.scratchCandidates
 		if candidateIDs, owned, ok := m.prefilterCandidatesCompact(tokens, tokenCount, firstID, buf[:0]); ok {
 			if owned && cap(candidateIDs) > cap(buf) {
 				m.scratchCandidates = candidateIDs[:0:cap(candidateIDs)]
 			}
-			if m.useIDScorer {
+			if m.useIDScorerFor(len(candidateIDs), tokenCount) {
 				var idBuf [128]uint64
 				ids := m.lookupTokenIDsPartial(tokens, idBuf[:0])
 				return m.fastMatchIDs(candidateIDs, ids, m.cfg.MatchThreshold, true, false), tokens
@@ -83,7 +84,7 @@ func (m *Matcher) findExactMatch(line string, tokenBuf []string) (cluster *clust
 			if owned && cap(candidateIDs) > cap(buf) {
 				m.scratchCandidates = candidateIDs[:0:cap(candidateIDs)]
 			}
-			if m.useIDScorer {
+			if m.useIDScorerFor(len(candidateIDs), tokenCount) {
 				var idBuf [128]uint64
 				ids := m.lookupTokenIDsPartial(tokens, idBuf[:0])
 				return m.fastMatchIDs(candidateIDs, ids, 1.0, true, true), tokens
@@ -221,6 +222,21 @@ func (m *Matcher) treeSearchStrings(tokens []string, simTh float64, includeParam
 	return m.fastMatchStrings(curNode.clusterIDs, tokens, simTh, includeParams, false)
 }
 
+// bbTarget returns the branch-and-bound score target for a candidate:
+// once a qualifying best exists (bestScore >= needed), a candidate is
+// only worth scoring while it can still beat it (tie on score wins only
+// with more params). Exact mode keeps the plain threshold — its id
+// tie-break can prefer an equal-score candidate.
+func bbTarget(exact bool, needed, bestScore, bestParams, paramCount int) int {
+	if exact || bestScore < needed {
+		return needed
+	}
+	if paramCount > bestParams {
+		return bestScore
+	}
+	return bestScore + 1
+}
+
 func (m *Matcher) fastMatch(clusterIDs []int, tokenIDs []uint64, simTh float64, includeParams, exact bool) *cluster {
 	nTokens := len(tokenIDs)
 	needed := m.requiredScore(nTokens, simTh)
@@ -244,6 +260,7 @@ func (m *Matcher) fastMatch(clusterIDs []int, tokenIDs []uint64, simTh float64, 
 		if includeParams {
 			simTokens = paramCount
 		}
+		target := bbTarget(exact, needed, maxScore, maxParamCount, paramCount)
 		npIdx := cluster.nonParamIdx
 		remaining := len(npIdx)
 		for _, idx := range npIdx {
@@ -251,7 +268,7 @@ func (m *Matcher) fastMatch(clusterIDs []int, tokenIDs []uint64, simTh float64, 
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < needed {
+			if simTokens+remaining < target {
 				break
 			}
 		}
@@ -363,6 +380,7 @@ func (m *Matcher) fastMatchStrings(clusterIDs []int, tokens []string, simTh floa
 		if includeParams {
 			simTokens = paramCount
 		}
+		target := bbTarget(exact, needed, maxScore, maxParamCount, paramCount)
 		npIdx := c.nonParamIdx
 		remaining := len(npIdx)
 		anchor0 := c.anchor0
@@ -372,7 +390,7 @@ func (m *Matcher) fastMatchStrings(clusterIDs []int, tokens []string, simTh floa
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < needed {
+			if simTokens+remaining < target {
 				continue
 			}
 		}
@@ -381,7 +399,7 @@ func (m *Matcher) fastMatchStrings(clusterIDs []int, tokens []string, simTh floa
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < needed {
+			if simTokens+remaining < target {
 				continue
 			}
 		}
@@ -394,7 +412,7 @@ func (m *Matcher) fastMatchStrings(clusterIDs []int, tokens []string, simTh floa
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < needed {
+			if simTokens+remaining < target {
 				break
 			}
 		}
@@ -492,6 +510,7 @@ func (m *Matcher) fastMatchIDs(clusterIDs []int, ids []uint64, simTh float64, in
 		if includeParams {
 			simTokens = paramCount
 		}
+		target := bbTarget(exact, needed, maxScore, maxParamCount, paramCount)
 		npIdx := c.nonParamIdx
 		remaining := len(npIdx)
 		anchor0 := c.anchor0
@@ -501,7 +520,7 @@ func (m *Matcher) fastMatchIDs(clusterIDs []int, ids []uint64, simTh float64, in
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < needed {
+			if simTokens+remaining < target {
 				continue
 			}
 		}
@@ -510,7 +529,7 @@ func (m *Matcher) fastMatchIDs(clusterIDs []int, ids []uint64, simTh float64, in
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < needed {
+			if simTokens+remaining < target {
 				continue
 			}
 		}
@@ -523,7 +542,7 @@ func (m *Matcher) fastMatchIDs(clusterIDs []int, ids []uint64, simTh float64, in
 				simTokens++
 			}
 			remaining--
-			if simTokens+remaining < needed {
+			if simTokens+remaining < target {
 				break
 			}
 		}
@@ -539,6 +558,24 @@ func (m *Matcher) fastMatchIDs(clusterIDs []int, ids []uint64, simTh float64, in
 		return maxCluster
 	}
 	return nil
+}
+
+// useIDScorerFor picks the candidate-verification strategy for one line.
+// The ID scorer pays tokenCount hash lookups up front to make each
+// candidate check a uint64 compare; the string scorer skips the lookups
+// but pays a string compare per candidate check. Measured break-even is
+// where the candidate count reaches the token count: below it the string
+// scorer wins (real-world corpora: few candidates, long lines), above it
+// the ID scorer wins by 3x+ (dense buckets: hundreds of candidates).
+func (m *Matcher) useIDScorerFor(candidates, tokenCount int) bool {
+	switch m.cfg.MatchScorer {
+	case MatchScorerString:
+		return false
+	case MatchScorerID:
+		return true
+	default: // MatchScorerAuto
+		return candidates >= tokenCount
+	}
 }
 
 // lookupTokenIDsPartial resolves tokens to dictionary IDs. Unknown tokens
@@ -631,7 +668,7 @@ func (m *Matcher) rebuildMatchPrefilter() {
 			if flByTC[tokenCount] == nil {
 				flByTC[tokenCount] = make(map[uint64][]int)
 			}
-			combined := (firstID << 32) | (lastID & 0xFFFFFFFF)
+			combined := packAnchorIDs(firstID, lastID)
 			flByTC[tokenCount][combined] = append(flByTC[tokenCount][combined], id)
 		}
 
@@ -697,20 +734,83 @@ func (m *Matcher) rebuildMatchPrefilter() {
 			buckets[tc].flKeys, buckets[tc].flVals = sortedU64Keys(mm)
 		}
 	}
-	for tc, mm := range anchorByTC {
-		if tc < len(buckets) {
-			buckets[tc].anchorKeys, buckets[tc].anchorVals = sortedAnchorKeys(mm)
-			buckets[tc].anchorPos = uniqueAnchorPositions(buckets[tc].anchorKeys)
+	maxProbe := 0
+	for tc := range buckets {
+		buckets[tc].buildAnchorIndex(anchorByTC[tc], anchorPairByTC[tc])
+		if n := len(buckets[tc].probePos); n > maxProbe {
+			maxProbe = n
 		}
 	}
-	for tc, mm := range anchorPairByTC {
-		if tc < len(buckets) {
-			buckets[tc].anchorPairKeys, buckets[tc].anchorPairVals = sortedAnchorPairKeys(mm)
-			buckets[tc].anchorPairPos = uniqueAnchorPairPositions(buckets[tc].anchorPairKeys)
-		}
-	}
+	m.scratchProbeIDs = make([]uint64, maxProbe)
 
 	m.prefilterBuckets = buckets
+}
+
+// buildAnchorIndex flattens the per-bucket anchor accumulator maps into
+// the probe-slot representation described on prefilterBucket: distinct
+// anchor positions get probePos slots, and each position (or position
+// pair) owns a sorted, contiguous ID range for binary search.
+func (b *prefilterBucket) buildAnchorIndex(singles map[anchorKey][]int, pairs map[anchorPairKey][]int) {
+	slots := make(map[uint16]uint16, 8)
+	slot := func(pos uint16) uint16 {
+		if s, ok := slots[pos]; ok {
+			return s
+		}
+		s := uint16(len(b.probePos))
+		slots[pos] = s
+		b.probePos = append(b.probePos, pos)
+		return s
+	}
+
+	if len(singles) > 0 {
+		keys := make([]anchorKey, 0, len(singles))
+		for k := range singles {
+			keys = append(keys, k)
+		}
+		slices.SortFunc(keys, compareAnchorKey)
+		prevPos := ^uint16(0)
+		for _, k := range keys {
+			if k.pos != prevPos {
+				b.anchorSlot = append(b.anchorSlot, slot(k.pos))
+				b.anchorStart = append(b.anchorStart, int32(len(b.anchorIDs)))
+				prevPos = k.pos
+			}
+			b.anchorIDs = append(b.anchorIDs, k.id)
+			b.anchorVals = append(b.anchorVals, singles[k])
+		}
+		b.anchorStart = append(b.anchorStart, int32(len(b.anchorIDs)))
+	}
+
+	if len(pairs) > 0 {
+		keys := make([]anchorPairKey, 0, len(pairs))
+		for k := range pairs {
+			keys = append(keys, k)
+		}
+		slices.SortFunc(keys, compareAnchorPairKey)
+		prev := anchorPairKey{pos0: ^uint16(0), pos1: ^uint16(0)}
+		for _, k := range keys {
+			if k.pos0 != prev.pos0 || k.pos1 != prev.pos1 {
+				b.anchorPairSlot = append(b.anchorPairSlot, [2]uint16{slot(k.pos0), slot(k.pos1)})
+				b.anchorPairStart = append(b.anchorPairStart, int32(len(b.anchorPairIDs)))
+			}
+			packed := packAnchorIDs(k.id0, k.id1)
+			groupStart := int(b.anchorPairStart[len(b.anchorPairStart)-1])
+			if n := len(b.anchorPairIDs); n > groupStart && b.anchorPairIDs[n-1] == packed {
+				// Packed collision (IDs beyond 32 bits): merge candidate
+				// lists — extra candidates are rejected by the scorer.
+				b.anchorPairVals[n-1] = append(b.anchorPairVals[n-1], pairs[k]...)
+			} else {
+				b.anchorPairIDs = append(b.anchorPairIDs, packed)
+				b.anchorPairVals = append(b.anchorPairVals, pairs[k])
+			}
+			prev = k
+		}
+		b.anchorPairStart = append(b.anchorPairStart, int32(len(b.anchorPairIDs)))
+	}
+}
+
+func packAnchorIDs(id0, id1 uint64) uint64 {
+	return (id0 << 32) | (id1 & 0xFFFFFFFF)
 }
 
 func (m *Matcher) prefilterCandidatesCompact(tokens []string, tokenCount int, firstID uint64, dst []int) (candidates []int, owned bool, ok bool) {
@@ -742,7 +842,7 @@ func (m *Matcher) prefilterCandidatesCompact(tokens []string, tokenCount int, fi
 			}
 		}
 		if firstKnown && lastKnown {
-			combined := (firstID << 32) | (lastID & 0xFFFFFFFF)
+			combined := packAnchorIDs(firstID, lastID)
 			if group := searchSortedU64(b.flKeys, b.flVals, combined); len(group) > 0 {
 				groups = append(groups, group)
 			}
@@ -754,7 +854,7 @@ func (m *Matcher) prefilterCandidatesCompact(tokens []string, tokenCount int, fi
 func (m *Matcher) prefilterExactCandidatesCompact(tokens []string, tokenCount int, dst []int) (candidates []int, owned bool, ok bool) {
 	b := &m.prefilterBuckets[tokenCount]
 	var groupBuf [16][]int
-	groupCount := 1 + len(b.anchorPos) + len(b.anchorPairPos)
+	groupCount := 1 + len(b.anchorSlot) + len(b.anchorPairSlot)
 	groups := groupBuf[:0]
 	if groupCount > len(groupBuf) {
 		groups = make([][]int, 0, groupCount)
@@ -763,38 +863,31 @@ func (m *Matcher) prefilterExactCandidatesCompact(tokens []string, tokenCount in
 		groups = append(groups, b.exactAny)
 	}
 
+	// Resolve each distinct anchor position once; every probe below reads
+	// its slot. Anchor positions are always < tokenCount: the bucket is
+	// keyed by token count and anchors come from its own templates.
 	dict := m.dictFrozen
-	for _, pos := range b.anchorPos {
-		if int(pos) >= tokenCount {
-			continue
-		}
-		id := dict.Map(tokens[pos])
+	ids := m.scratchProbeIDs[:len(b.probePos)]
+	for s, pos := range b.probePos {
+		ids[s] = dict.Map(tokens[pos])
+	}
+	for i, slot := range b.anchorSlot {
+		id := ids[slot]
 		if id == constmap.NotFound {
 			continue
 		}
-		if group := searchSortedAnchor(b.anchorKeys, b.anchorVals, anchorKey{pos: pos, id: id}); len(group) > 0 {
+		lo, hi := b.anchorStart[i], b.anchorStart[i+1]
+		if group := searchSortedU64(b.anchorIDs[lo:hi], b.anchorVals[lo:hi], id); len(group) > 0 {
 			groups = append(groups, group)
 		}
 	}
-	for _, pos := range b.anchorPairPos {
-		if int(pos.pos0) >= tokenCount || int(pos.pos1) >= tokenCount {
+	for i, sl := range b.anchorPairSlot {
+		id0, id1 := ids[sl[0]], ids[sl[1]]
+		if id0 == constmap.NotFound || id1 == constmap.NotFound {
 			continue
 		}
-		id0 := dict.Map(tokens[pos.pos0])
-		if id0 == constmap.NotFound {
-			continue
-		}
-		id1 := dict.Map(tokens[pos.pos1])
-		if id1 == constmap.NotFound {
-			continue
-		}
-		key := anchorPairKey{
-			pos0: pos.pos0,
-			pos1: pos.pos1,
-			id0:  id0,
-			id1:  id1,
-		}
-		if group := searchSortedAnchorPair(b.anchorPairKeys, b.anchorPairVals, key); len(group) > 0 {
+		lo, hi := b.anchorPairStart[i], b.anchorPairStart[i+1]
+		if group := searchSortedU64(b.anchorPairIDs[lo:hi], b.anchorPairVals[lo:hi], packAnchorIDs(id0, id1)); len(group) > 0 {
 			groups = append(groups, group)
 		}
 	}
@@ -814,65 +907,6 @@ func sortedU64Keys(m map[uint64][]int) ([]uint64, [][]int) {
 	return keys, vals
 }
 
-func sortedAnchorKeys(m map[anchorKey][]int) ([]anchorKey, [][]int) {
-	keys := make([]anchorKey, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	slices.SortFunc(keys, compareAnchorKey)
-	vals := make([][]int, len(keys))
-	for i, k := range keys {
-		vals[i] = m[k]
-	}
-	return keys, vals
-}
-
-func sortedAnchorPairKeys(m map[anchorPairKey][]int) ([]anchorPairKey, [][]int) {
-	keys := make([]anchorPairKey, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	slices.SortFunc(keys, compareAnchorPairKey)
-	vals := make([][]int, len(keys))
-	for i, k := range keys {
-		vals[i] = m[k]
-	}
-	return keys, vals
-}
-
-func uniqueAnchorPositions(keys []anchorKey) []uint16 {
-	if len(keys) == 0 {
-		return nil
-	}
-	positions := make([]uint16, 0, len(keys))
-	last := uint16(^uint16(0))
-	for _, key := range keys {
-		if key.pos == last {
-			continue
-		}
-		positions = append(positions, key.pos)
-		last = key.pos
-	}
-	return positions
-}
-
-func uniqueAnchorPairPositions(keys []anchorPairKey) []anchorPairPos {
-	if len(keys) == 0 {
-		return nil
-	}
-	positions := make([]anchorPairPos, 0, len(keys))
-	last := anchorPairPos{pos0: ^uint16(0), pos1: ^uint16(0)}
-	for _, key := range keys {
-		pos := anchorPairPos{pos0: key.pos0, pos1: key.pos1}
-		if pos == last {
-			continue
-		}
-		positions = append(positions, pos)
-		last = pos
-	}
-	return positions
-}
-
 func searchSortedU64(keys []uint64, vals [][]int, target uint64) []int {
 	lo, hi := 0, len(keys)
 	for lo < hi {
@@ -889,40 +923,6 @@ func searchSortedU64(keys []uint64, vals [][]int, target uint64) []int {
 	return nil
 }
 
-func searchSortedAnchor(keys []anchorKey, vals [][]int, target anchorKey) []int {
-	lo, hi := 0, len(keys)
-	for lo < hi {
-		mid := lo + (hi-lo)/2
-		c := compareAnchorKey(keys[mid], target)
-		if c == 0 {
-			return vals[mid]
-		}
-		if c < 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return nil
-}
-
-func searchSortedAnchorPair(keys []anchorPairKey, vals [][]int, target anchorPairKey) []int {
-	lo, hi := 0, len(keys)
-	for lo < hi {
-		mid := lo + (hi-lo)/2
-		c := compareAnchorPairKey(keys[mid], target)
-		if c == 0 {
-			return vals[mid]
-		}
-		if c < 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return nil
-}
-
 func compareAnchorKey(a, b anchorKey) int {
 	if c := cmp.Compare(a.pos, b.pos); c != 0 {
 		return c
@@ -930,6 +930,9 @@ func compareAnchorKey(a, b anchorKey) int {
 	return cmp.Compare(a.id, b.id)
 }
 
+// compareAnchorPairKey orders by position pair, then by packed ID — the
+// same key the probe path binary-searches — so each position group's ID
+// range is search-ordered even when raw IDs exceed 32 bits.
 func compareAnchorPairKey(a, b anchorPairKey) int {
 	if c := cmp.Compare(a.pos0, b.pos0); c != 0 {
 		return c
@@ -937,10 +940,7 @@ func compareAnchorPairKey(a, b anchorPairKey) int {
 	if c := cmp.Compare(a.pos1, b.pos1); c != 0 {
 		return c
 	}
-	if c := cmp.Compare(a.id0, b.id0); c != 0 {
-		return c
-	}
-	return cmp.Compare(a.id1, b.id1)
+	return cmp.Compare(packAnchorIDs(a.id0, a.id1), packAnchorIDs(b.id0, b.id1))
 }
 
 // mergePrefilterGroups returns the union of the candidate groups. The owned

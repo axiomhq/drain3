@@ -1,8 +1,11 @@
 package drain3
 
 import (
+	"encoding/binary"
+	"math/bits"
 	"slices"
 	"strings"
+	"unsafe"
 
 	"github.com/bits-and-blooms/bitset"
 	"github.com/lemire/constmap"
@@ -41,12 +44,12 @@ type Matcher struct {
 	matchNeeded      []int                      // precomputed ceil(MatchThreshold * tokenCount), keyed by token count
 
 	hasParamFirst bool // true if any cluster has paramID at position 0
-	useIDScorer   bool // resolved from cfg.MatchScorer + template count at freeze
 
 	// Scratch buffers — reused across calls.
 	scratchIDs        []uint64
 	scratchTok        []string
 	scratchCandidates []int
+	scratchProbeIDs   []uint64 // per-line anchor-position ID resolutions, indexed by probePos slot
 }
 
 type prefilterBucket struct {
@@ -60,23 +63,29 @@ type prefilterBucket struct {
 	flVals    [][]int  // candidate template IDs for flKeys
 	exactAny  []int    // exact-match templates with no literal anchor tokens
 
-	// Exact Match prefilter groups candidates by first/last non-param anchors.
-	anchorPos      []uint16        // positions with a single non-param anchor
-	anchorKeys     []anchorKey     // sorted single-anchor lookups
-	anchorVals     [][]int         // candidate template IDs for anchorKeys
-	anchorPairPos  []anchorPairPos // position pairs with two non-param anchors
-	anchorPairKeys []anchorPairKey // sorted two-anchor lookups
-	anchorPairVals [][]int         // candidate template IDs for anchorPairKeys
+	// Exact Match prefilter groups candidates by first/last non-param
+	// anchors. Each distinct anchor position resolves to a dictionary ID
+	// once per line into a probePos slot; single- and pair-anchor groups
+	// then binary-search their per-position ID range. Pair IDs are packed
+	// (id0<<32)|id1 like flKeys — a collision only adds false candidates,
+	// which the scorer rejects.
+	probePos        []uint16    // distinct anchor positions, resolved once per line
+	anchorSlot      []uint16    // per single-anchor position: slot into probePos
+	anchorStart     []int32     // len(anchorSlot)+1 prefix ranges into anchorIDs
+	anchorIDs       []uint64    // sorted anchor-token IDs within each position range
+	anchorVals      [][]int     // candidate template IDs for anchorIDs
+	anchorPairSlot  [][2]uint16 // per anchor-position pair: slots into probePos
+	anchorPairStart []int32     // len(anchorPairSlot)+1 prefix ranges into anchorPairIDs
+	anchorPairIDs   []uint64    // sorted packed anchor-ID pairs within each range
+	anchorPairVals  [][]int     // candidate template IDs for anchorPairIDs
 }
 
+// anchorKey and anchorPairKey are build-time accumulator keys for
+// rebuildMatchPrefilter; the probe path uses the flattened slot/range
+// representation on prefilterBucket.
 type anchorKey struct {
 	pos uint16
 	id  uint64
-}
-
-type anchorPairPos struct {
-	pos0 uint16
-	pos1 uint16
 }
 
 type anchorPairKey struct {
@@ -242,17 +251,6 @@ func (m *Matcher) freezeDict() {
 			break
 		}
 	}
-	// Resolve the prefilter scorer once. Auto picks ID for large
-	// dictionaries (candidate scans amortize the per-line token-ID
-	// resolution) and String for small ones (no regression).
-	switch m.cfg.MatchScorer {
-	case MatchScorerString:
-		m.useIDScorer = false
-	case MatchScorerID:
-		m.useIDScorer = true
-	default: // MatchScorerAuto
-		m.useIDScorer = len(m.templates) >= autoScorerTemplateThreshold
-	}
 }
 
 func tokenize(content string, extraDelimiters []string) []string {
@@ -270,29 +268,54 @@ func tokenize(content string, extraDelimiters []string) []string {
 // a single pass, eliminating the separate strings.Count call.
 // maxTokens limits scanning: if the count would exceed maxTokens the
 // function returns early with a count > maxTokens so the caller can reject.
+//
+// Spaces are located with a SWAR scan, 8 bytes per load. The mask is the
+// carry-free per-byte equality test — (x&^hi)+0x7f sets bit 7 of a byte
+// iff its low 7 bits are nonzero and never carries across bytes — so
+// every set bit marks a space exactly and one load serves all spaces in
+// the window. Measured on M3 Max against real log lines (~12 B/token):
+// 1.75x over the byte loop; a strings.IndexByte loop was a wash (call
+// overhead per short token cancels the SIMD win).
 func tokenizeWhitespaceCount(content string, dst []string, maxTokens int) ([]string, int) {
 	if content == "" || maxTokens <= 0 {
 		return dst[:0], 0
 	}
-
+	const (
+		swarHi     = 0x8080808080808080
+		swarLo7    = 0x7f7f7f7f7f7f7f7f
+		swarSpaces = 0x2020202020202020
+	)
+	buf := unsafe.Slice(unsafe.StringData(content), len(content))
+	n := len(content)
 	dst = dst[:0]
 	start := 0
 	count := 1
-
-	for i := 0; i < len(content); i++ {
-		if content[i] != ' ' {
-			continue
-		}
-		dst = append(dst, content[start:i])
-		start = i + 1
-		count++
-		if count > maxTokens {
-			return dst, count
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		x := binary.LittleEndian.Uint64(buf[i:]) ^ swarSpaces
+		m := ^(((x &^ swarHi) + swarLo7) | x) & swarHi
+		for m != 0 {
+			j := i + bits.TrailingZeros64(m)>>3
+			m &= m - 1
+			dst = append(dst, content[start:j])
+			start = j + 1
+			count++
+			if count > maxTokens {
+				return dst, count
+			}
 		}
 	}
-
-	dst = append(dst, content[start:])
-	return dst, count
+	for ; i < n; i++ {
+		if content[i] == ' ' {
+			dst = append(dst, content[start:i])
+			start = i + 1
+			count++
+			if count > maxTokens {
+				return dst, count
+			}
+		}
+	}
+	return append(dst, content[start:]), count
 }
 
 func hasNumbers(s string) bool {
