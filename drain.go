@@ -1,11 +1,7 @@
 package drain3
 
 import (
-	"encoding/binary"
-	"math/bits"
 	"slices"
-	"strings"
-	"unsafe"
 
 	"github.com/bits-and-blooms/bitset"
 	"github.com/lemire/constmap"
@@ -50,6 +46,7 @@ type Matcher struct {
 	// Training-only scratch. Match-path scratch lives on Session.
 	scratchIDs []uint64
 	scratchTok []string
+	trainBM    []uint64
 
 	// defaultSession backs the Matcher-level Match* methods, preserving
 	// the historical one-goroutine-per-Matcher contract for them.
@@ -185,6 +182,7 @@ func newMatcher(cfg Config) *Matcher {
 		dictNextID:  1,
 	}
 	m.paramID = m.internToken(cfg.ParamString)
+	m.trainBM = make([]uint64, bitmapWords(cfg.MaxBytes))
 	return m
 }
 
@@ -262,80 +260,6 @@ func (m *Matcher) freezeDict() {
 		}
 	}
 	m.defaultSession = m.NewSession()
-}
-
-func tokenize(content string, extraDelimiters []string) []string {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return nil
-	}
-	for _, delimiter := range extraDelimiters {
-		content = strings.ReplaceAll(content, delimiter, " ")
-	}
-	return strings.Fields(content)
-}
-
-// tokenizeWhitespaceCount splits on spaces and returns the token count in
-// a single pass, eliminating the separate strings.Count call.
-// maxTokens limits scanning: if the count would exceed maxTokens the
-// function returns early with a count > maxTokens so the caller can reject.
-//
-// Spaces are located with a SWAR scan, 8 bytes per load. The mask is the
-// carry-free per-byte equality test — (x&^hi)+0x7f sets bit 7 of a byte
-// iff its low 7 bits are nonzero and never carries across bytes — so
-// every set bit marks a space exactly and one load serves all spaces in
-// the window. Measured on M3 Max against real log lines (~12 B/token):
-// 1.75x over the byte loop; a strings.IndexByte loop was a wash (call
-// overhead per short token cancels the SIMD win).
-func tokenizeWhitespaceCount(content string, dst []string, maxTokens int) ([]string, int) {
-	if content == "" || maxTokens <= 0 {
-		return dst[:0], 0
-	}
-	const (
-		swarHi     = 0x8080808080808080
-		swarLo7    = 0x7f7f7f7f7f7f7f7f
-		swarSpaces = 0x2020202020202020
-	)
-	buf := unsafe.Slice(unsafe.StringData(content), len(content))
-	n := len(content)
-	dst = dst[:0]
-	start := 0
-	count := 1
-	i := 0
-	for ; i+8 <= n; i += 8 {
-		x := binary.LittleEndian.Uint64(buf[i:]) ^ swarSpaces
-		m := ^(((x &^ swarHi) + swarLo7) | x) & swarHi
-		for m != 0 {
-			j := i + bits.TrailingZeros64(m)>>3
-			m &= m - 1
-			dst = append(dst, content[start:j])
-			start = j + 1
-			count++
-			if count > maxTokens {
-				return dst, count
-			}
-		}
-	}
-	for ; i < n; i++ {
-		if content[i] == ' ' {
-			dst = append(dst, content[start:i])
-			start = i + 1
-			count++
-			if count > maxTokens {
-				return dst, count
-			}
-		}
-	}
-	return append(dst, content[start:]), count
-}
-
-func hasNumbers(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			return true
-		}
-	}
-	return false
 }
 
 func deepCopyTemplates(in []Template) []Template {

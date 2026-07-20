@@ -142,7 +142,7 @@ func (s *Session) tokenizeMatchLine(line string) (tokens []string, tokenCount in
 		firstID = id
 	}
 	if len(m.cfg.ExtraDelimiters) == 0 {
-		tokens, tokenCount = tokenizeWhitespaceCount(line, s.tok, m.cfg.MaxTokens)
+		tokens, tokenCount = tokenizeWhitespaceCount(line, s.tok, m.cfg.MaxTokens, s.spaceBM)
 		if tokenCount > m.cfg.MaxTokens {
 			return nil, 0, constmap.NotFound, false
 		}

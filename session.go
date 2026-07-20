@@ -8,6 +8,7 @@ type Session struct {
 	tok        []string
 	candidates []int
 	probeIDs   []uint64
+	spaceBM    []uint64
 }
 
 // NewSession returns a Session for matching against m. It panics if m
@@ -22,6 +23,7 @@ func (m *Matcher) NewSession() *Session {
 		tok:        make([]string, 0, m.cfg.MaxTokens),
 		candidates: make([]int, 0, 1024),
 		probeIDs:   make([]uint64, m.maxProbe),
+		spaceBM:    make([]uint64, bitmapWords(m.cfg.MaxBytes)),
 	}
 }
 

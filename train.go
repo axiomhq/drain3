@@ -146,7 +146,7 @@ func (m *Matcher) addLogMessage(content string) {
 		}
 	} else {
 		var tokenCount int
-		m.scratchTok, tokenCount = tokenizeWhitespaceCount(content, m.scratchTok, m.cfg.MaxTokens)
+		m.scratchTok, tokenCount = tokenizeWhitespaceCount(content, m.scratchTok, m.cfg.MaxTokens, m.trainBM)
 		if tokenCount > m.cfg.MaxTokens {
 			return
 		}
