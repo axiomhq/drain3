@@ -105,10 +105,13 @@ func BenchmarkMatchBatchAll(b *testing.B) {
 	}
 	s := benchMatcher.NewSession()
 	var res drain3.BatchResult
+	const chunk = 8192 // one column block per call: the arena stays reused and cache-warm
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		s.MatchBatch(benchLines, &res)
+		for start := 0; start < len(benchLines); start += chunk {
+			s.MatchBatch(benchLines[start:min(start+chunk, len(benchLines))], &res)
+		}
 	}
 	b.ReportMetric(float64(len(benchLines)), "lines/op")
 }
