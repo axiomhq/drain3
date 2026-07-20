@@ -79,3 +79,27 @@ func TestSessionConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestSessionRebindsAfterRebuild pins the default session's back-pointer
+// after NewMatcherFromTemplates, which publishes the matcher by value
+// (*m = *next) and would otherwise leave the session pointing at the
+// discarded build-time Matcher.
+func TestSessionRebindsAfterRebuild(t *testing.T) {
+	src, err := Train([]string{
+		"svc auth user 1 ip 10.0.0.1",
+		"svc auth user 2 ip 10.0.0.2",
+	})
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+	m, err := NewMatcherFromTemplates(src.Config(), src.Templates())
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if id, ok := m.MatchID("svc auth user 9 ip 1.2.3.4"); !ok || id == 0 {
+		t.Fatalf("rebuilt matcher: got (%d,%v), want a hit", id, ok)
+	}
+	if m.defaultSession == nil || m.defaultSession.m != m {
+		t.Fatalf("default session back-pointer not rebound to the published Matcher")
+	}
+}

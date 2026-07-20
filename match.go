@@ -17,18 +17,20 @@ func (m *Matcher) Match(line string) (templateID int, args []string, ok bool) {
 
 // MatchID returns just the template id and whether a match was found, without extracting args.
 func (m *Matcher) MatchID(line string) (templateID int, ok bool) {
-	if m == nil || m.defaultSession == nil {
+	s := m.session()
+	if s == nil {
 		return 0, false
 	}
-	return m.defaultSession.MatchID(line)
+	return s.MatchID(line)
 }
 
 // MatchInto returns template id, extracted args into dst, and whether a match was found.
 func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []string, ok bool) {
-	if m == nil || m.defaultSession == nil {
+	s := m.session()
+	if s == nil {
 		return 0, nil, false
 	}
-	return m.defaultSession.MatchInto(line, dst)
+	return s.MatchInto(line, dst)
 }
 
 // MatchExactInto returns a match only when every non-param template token
@@ -36,10 +38,24 @@ func (m *Matcher) MatchInto(line string, dst []string) (templateID int, args []s
 // as wildcards. When several templates qualify, the most parametrized one is
 // returned, ties broken by lowest template ID, so the result is deterministic.
 func (m *Matcher) MatchExactInto(line string, dst []string) (templateID int, args []string, ok bool) {
-	if m == nil || m.defaultSession == nil {
+	s := m.session()
+	if s == nil {
 		return 0, nil, false
 	}
-	return m.defaultSession.MatchExactInto(line, dst)
+	return s.MatchExactInto(line, dst)
+}
+
+// session returns the Matcher-level default Session, rebuilding it if
+// the Matcher was copied by value after freezing (rebuildFromTemplates
+// publishes via *m = *next), which leaves the back-pointer stale.
+func (m *Matcher) session() *Session {
+	if m == nil || m.dictFrozen == nil {
+		return nil
+	}
+	if m.defaultSession == nil || m.defaultSession.m != m {
+		m.defaultSession = m.NewSession()
+	}
+	return m.defaultSession
 }
 
 func (s *Session) findMatch(line string) (cluster *cluster, tokens []string) {
