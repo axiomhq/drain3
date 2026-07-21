@@ -1,8 +1,8 @@
 #include "textflag.h"
 
-// func spaceBitmapBlocksAVX2(p *byte, blocks int, bm *uint64)
+// func spaceBitmapBlocks(p *byte, blocks int, bm *uint64)
 // One uint64 bitmap word per 64 input bytes: bit i set iff byte i == ' '.
-TEXT ·spaceBitmapBlocksAVX2(SB), NOSPLIT, $0-24
+TEXT ·spaceBitmapBlocks(SB), NOSPLIT, $0-24
 	MOVQ	p+0(FP), AX
 	MOVQ	blocks+8(FP), CX
 	MOVQ	bm+16(FP), DX

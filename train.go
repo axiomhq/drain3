@@ -3,6 +3,7 @@ package drain3
 import (
 	"cmp"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/bits-and-blooms/bitset"
@@ -60,6 +61,9 @@ func (m *Matcher) rebuildFromTemplates(cfg Config, templates []Template) error {
 	for _, t := range sorted {
 		if t.ID <= 0 {
 			return fmt.Errorf("template id must be > 0, got %d", t.ID)
+		}
+		if t.ID > math.MaxInt32 {
+			return fmt.Errorf("template id %d exceeds int32 range required by MatchBatch", t.ID)
 		}
 		if _, exists := seenIDs[t.ID]; exists {
 			return fmt.Errorf("duplicate template id %d", t.ID)

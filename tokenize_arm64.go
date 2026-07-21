@@ -2,24 +2,9 @@
 
 package drain3
 
-import "unsafe"
+const haveBlockKernel = true
 
-// spaceBitmap fills bm with one bit per input byte: bit i is set iff
-// content[i] == ' ', packed 64 bytes per word. Full 64-byte blocks go
-// through the NEON kernel; the tail is finished by the SWAR kernel so
-// no load ever crosses the end of the string.
-func spaceBitmap(content string, bm []uint64) {
-	n := len(content)
-	blocks := n >> 6
-	if blocks > 0 {
-		spaceBitmapBlocks(unsafe.StringData(content), blocks, &bm[0])
-	}
-	if tail := n & 63; tail != 0 {
-		var w [1]uint64
-		spaceBitmapSWAR(content[blocks<<6:], w[:])
-		bm[blocks] = w[0]
-	}
-}
-
+// spaceBitmapBlocks is the NEON kernel, implemented in tokenize_arm64.s.
+//
 //go:noescape
 func spaceBitmapBlocks(p *byte, blocks int, bm *uint64)

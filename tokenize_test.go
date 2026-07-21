@@ -68,17 +68,19 @@ func TestTokenizeWhitespaceCount(t *testing.T) {
 	}
 }
 
+// naiveSpaceBitmap is the reference oracle for the bitmap kernels.
+func naiveSpaceBitmap(s string) []uint64 {
+	bm := make([]uint64, bitmapWords(len(s)))
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' {
+			bm[i>>6] |= 1 << (i & 63)
+		}
+	}
+	return bm
+}
+
 // TestSpaceBitmap locks the bitmap kernels against a naive scan.
 func TestSpaceBitmap(t *testing.T) {
-	naive := func(s string) []uint64 {
-		bm := make([]uint64, bitmapWords(len(s)))
-		for i := 0; i < len(s); i++ {
-			if s[i] == ' ' {
-				bm[i>>6] |= 1 << (i & 63)
-			}
-		}
-		return bm
-	}
 	rng := rand.New(rand.NewSource(11))
 	cases := []string{"", " ", "a", strings.Repeat(" ", 200), strings.Repeat("x", 200)}
 	cases = append(cases, strings.Repeat("token pair  ", 512)) // 6KB, block-crossing spaces
@@ -90,7 +92,7 @@ func TestSpaceBitmap(t *testing.T) {
 		cases = append(cases, string(b))
 	}
 	for _, s := range cases {
-		want := naive(s)
+		want := naiveSpaceBitmap(s)
 		got := make([]uint64, bitmapWords(len(s)))
 		for i := range got {
 			got[i] = ^uint64(0) // poison: kernels must overwrite every word
@@ -146,12 +148,7 @@ func FuzzSpaceBitmap(f *testing.F) {
 	f.Add("a b  c")
 	f.Add(strings.Repeat(" x", 100))
 	f.Fuzz(func(t *testing.T, s string) {
-		want := make([]uint64, bitmapWords(len(s)))
-		for i := 0; i < len(s); i++ {
-			if s[i] == ' ' {
-				want[i>>6] |= 1 << (i & 63)
-			}
-		}
+		want := naiveSpaceBitmap(s)
 		got := make([]uint64, bitmapWords(len(s)))
 		spaceBitmap(s, got)
 		if !slices.Equal(got, want) {

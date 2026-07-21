@@ -148,6 +148,11 @@ func TestMatchBatchEquivalence(t *testing.T) {
 			}
 		}
 	}
+
+	empty := s.MatchBatch(nil, nil)
+	if len(empty.IDs) != 0 || len(empty.ArgOff) != 1 || empty.ArgOff[0] != 0 || len(empty.Args) != 0 {
+		t.Fatalf("empty batch: IDs=%v ArgOff=%v Args=%v", empty.IDs, empty.ArgOff, empty.Args)
+	}
 }
 
 // TestMatchBatchReuse verifies a warm BatchResult allocates nothing.

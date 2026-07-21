@@ -2,6 +2,7 @@ package drain3
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -424,6 +425,20 @@ func TestTrainWithConfigValidation(t *testing.T) {
 func TestZeroValueConfigIsRejected(t *testing.T) {
 	if _, err := TrainWithConfig([]string{"a b c"}, Config{}); err == nil {
 		t.Fatalf("expected error for zero-value Config{}")
+	}
+}
+
+// TestRebuildRejectsHugeTemplateID pins the int32 bound MatchBatch's
+// BatchResult.IDs contract depends on.
+func TestRebuildRejectsHugeTemplateID(t *testing.T) {
+	src, err := Train([]string{"aa bb cc"})
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+	tmpl := src.Templates()
+	tmpl[0].ID = math.MaxInt32 + 1
+	if _, err := NewMatcherFromTemplates(src.Config(), tmpl); err == nil {
+		t.Fatalf("want error for template id above int32 range")
 	}
 }
 

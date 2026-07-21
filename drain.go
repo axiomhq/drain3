@@ -259,7 +259,6 @@ func (m *Matcher) freezeDict() {
 			break
 		}
 	}
-	m.defaultSession = m.NewSession()
 }
 
 func deepCopyTemplates(in []Template) []Template {

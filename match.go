@@ -45,14 +45,14 @@ func (m *Matcher) MatchExactInto(line string, dst []string) (templateID int, arg
 	return s.MatchExactInto(line, dst)
 }
 
-// session returns the Matcher-level default Session, rebuilding it if
-// the Matcher was copied by value after freezing (rebuildFromTemplates
-// publishes via *m = *next), which leaves the back-pointer stale.
+// session returns the Matcher-level default Session, created lazily on
+// first use so it always binds to the published Matcher (train.go's
+// rebuildFromTemplates publishes by value with *m = *next).
 func (m *Matcher) session() *Session {
 	if m == nil || m.dictFrozen == nil {
 		return nil
 	}
-	if m.defaultSession == nil || m.defaultSession.m != m {
+	if m.defaultSession == nil {
 		m.defaultSession = m.NewSession()
 	}
 	return m.defaultSession

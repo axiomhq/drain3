@@ -10,10 +10,9 @@ import (
 // bitmapWords returns the space-bitmap length for maxBytes of input.
 func bitmapWords(maxBytes int) int { return (maxBytes + 63) / 64 }
 
-// spaceBitmap (defined per-platform in tokenize_asm.go / tokenize_noasm.go)
-// fills bm with one bit per input byte: bit i is set iff content[i] == ' ',
-// packed 64 bytes per word. All (len+63)/64 words are overwritten; bits at
-// or beyond len(content) are zero.
+// spaceBitmap is defined per-platform in tokenize_asm.go (arm64/amd64) and
+// tokenize_noasm.go (other platforms); see the doc contract on tokenize_asm.go's
+// spaceBitmap.
 
 // spaceBitmapSWAR is the pure-Go kernel and the oracle for the
 // assembly kernels. Per 8 bytes: the carry-free per-byte equality mask
