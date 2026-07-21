@@ -2,6 +2,7 @@
 
 // func spaceBitmapBlocks(p *byte, blocks int, bm *uint64)
 // One uint64 bitmap word per 64 input bytes: bit i set iff byte i == ' '.
+// Precondition: blocks >= 1 (caller guards); do-while loop underflows on 0.
 TEXT ·spaceBitmapBlocks(SB), NOSPLIT, $0-24
 	MOVQ	p+0(FP), AX
 	MOVQ	blocks+8(FP), CX

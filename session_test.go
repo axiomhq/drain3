@@ -62,8 +62,21 @@ func TestSessionConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)
-		go func() {
+		go func(g int) {
 			defer wg.Done()
+			if g == 0 {
+				for i := 0; i < 1000; i++ {
+					if _, ok := m.MatchID("svc auth user 7 ip 9.9.9.9"); !ok {
+						t.Error("expected hit")
+						return
+					}
+					if _, ok := m.MatchID("zzz unknown zzz"); ok {
+						t.Error("expected miss")
+						return
+					}
+				}
+				return
+			}
 			s := m.NewSession()
 			for i := 0; i < 1000; i++ {
 				if _, ok := s.MatchID("svc auth user 7 ip 9.9.9.9"); !ok {
@@ -75,7 +88,7 @@ func TestSessionConcurrent(t *testing.T) {
 					return
 				}
 			}
-		}()
+		}(g)
 	}
 	wg.Wait()
 }

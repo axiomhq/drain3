@@ -436,7 +436,11 @@ func TestRebuildRejectsHugeTemplateID(t *testing.T) {
 		t.Fatalf("train: %v", err)
 	}
 	tmpl := src.Templates()
-	tmpl[0].ID = math.MaxInt32 + 1
+	if math.MaxInt == math.MaxInt32 {
+		t.Skip("int is 32-bit; IDs above MaxInt32 are unrepresentable")
+	}
+	id := math.MaxInt32
+	tmpl[0].ID = id + 1
 	if _, err := NewMatcherFromTemplates(src.Config(), tmpl); err == nil {
 		t.Fatalf("want error for template id above int32 range")
 	}

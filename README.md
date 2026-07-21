@@ -95,6 +95,9 @@ For block workloads (e.g. column compression) use `Session.MatchBatch`: `s := m.
 | `(*Matcher).MatchID(line)` | Return `(id, ok)` without extracting params. |
 | `(*Matcher).Templates()` | Snapshot of trained templates (sorted by count desc). |
 | `(*Matcher).Config()` | Copy of the matcher's effective config. |
+| `NewSession() *Session` | Per-goroutine session for a shared trained Matcher. |
+| `Session.MatchBatch(lines, *BatchResult)` | Batch match into reusable struct-of-arrays result. |
+| `Session.Match/MatchID/MatchInto/MatchExactInto` | Per-line matching without the Matcher-level single-goroutine restriction. |
 
 ## Performance
 

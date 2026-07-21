@@ -12,8 +12,8 @@ type Session struct {
 }
 
 // NewSession returns a Session for matching against m. It panics if m
-// has not been trained (built via Train, TrainWithConfig, or
-// NewMatcherFromTemplates).
+// has not been trained with at least one template (Train, TrainWithConfig,
+// or NewMatcherFromTemplates with a non-empty template set).
 func (m *Matcher) NewSession() *Session {
 	if m == nil || m.dictFrozen == nil {
 		panic("drain3: NewSession on an untrained Matcher")
@@ -85,6 +85,8 @@ func (r *BatchResult) reset(n int) {
 // MatchBatch matches every line and writes struct-of-arrays results
 // into dst, allocating a fresh BatchResult when dst is nil. Template
 // IDs are dense and far below MaxInt32 in any trainable dictionary.
+// A single call is limited to batches whose total extracted args stay
+// below MaxInt32; block-shaped batches are far below that.
 func (s *Session) MatchBatch(lines []string, dst *BatchResult) *BatchResult {
 	if dst == nil {
 		dst = &BatchResult{}

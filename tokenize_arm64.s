@@ -10,6 +10,7 @@ GLOBL spaceScanWeights<>(SB), RODATA|NOPTR, $16
 // AND with the per-lane bit weights {1,2,4,8,16,32,64,128}x2, then three
 // pairwise adds fold the 64 weighted lanes into the 8 bytes of V0.D[0]:
 // byte k holds bits 8k..8k+7, so V0.D[0] read little-endian is the word.
+// Precondition: blocks >= 1 (caller guards); do-while loop underflows on 0.
 TEXT ·spaceBitmapBlocks(SB), NOSPLIT, $0-24
 	MOVD	p+0(FP), R0
 	MOVD	blocks+8(FP), R1
